@@ -9,15 +9,11 @@ def norm(x):
 class Config:
     vocab_size: int = 8192
     block_size: int = 1024
-    n_layer: int = 2 # num new layers
     r_layer: int = 2 # num reuse layers
+    n_layer: int = 2 # num new layers
     n_head: int = 4
     n_embd: int = 64
     n_qkv: int = 256
-    rope_theta: float = 150000.0
-    rope_scaling_factor: float = 32.0
-    rope_ntk_alpha: float = 1.0
-    rope_ntk_beta: float = 32.0
 
 class CastedLinear(nn.Module):
     def __init__(self, in_features, out_features):
@@ -39,74 +35,24 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.w)
 
-class Rotary(torch.nn.Module):
-    def __init__(self, config: Config):
+class Rotary(nn.Module):
+    def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        self.head_dim = config.n_embd // config.n_head
-        self.base = config.rope_theta
-        self.block_size = config.block_size
-        self.scaling_factor = config.rope_scaling_factor
-        self.ntk_alpha = config.rope_ntk_alpha
-        self.ntk_beta = config.rope_ntk_beta
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        t = torch.arange(max_seq_len, dtype=torch.float32)
+        theta = torch.einsum("i,j -> ij", t, angular_freq)
+        self.cos = nn.Buffer(theta.cos(), persistent=False)
+        self.sin = nn.Buffer(theta.sin(), persistent=False)
 
-    def _compute_concentration_and_inv_freq(self):
-        """See YaRN paper: https://arxiv.org/abs/2309.00071"""
-        freq = self.base ** (torch.arange(0, self.head_dim, 2) / self.head_dim)
-
-        if self.scaling_factor > 1.0:
-            concentration = (0.1 * math.log(self.scaling_factor) + 1.0)  # YaRN concentration
-
-            d_half = self.head_dim / 2
-
-            # NTK by parts
-            low = (d_half * math.log(self.block_size / (self.ntk_beta * 2 * math.pi)) / math.log(self.base))
-            high = (d_half * math.log(self.block_size / (self.ntk_alpha * 2 * math.pi)) / math.log(self.base))
-            assert 0 < low < high < d_half - 1
-
-            interpolation = 1.0 / (self.scaling_factor * freq)
-            extrapolation = 1.0 / freq
-
-            ramp = (torch.arange(d_half) - low) / (high - low)
-            mask = 1 - ramp.clamp(0, 1)
-
-            inv_freq = interpolation * (1 - mask) + extrapolation * mask
-
-        else:
-            concentration = 1.0
-            inv_freq = 1.0 / freq
-
-        return concentration, inv_freq
-
-    def _compute_cos_sin(self, num_tokens):
-        concentration, inv_freq = self._compute_concentration_and_inv_freq()
-        t = torch.arange(num_tokens)
-        freqs = torch.einsum("i,j->ij", t, inv_freq)
-        cos = freqs.cos() * concentration
-        sin = freqs.sin() * concentration
-        return cos, sin
-
-    def _apply_rotary_emb(x, cos: torch.Tensor, sin: torch.Tensor):
-        cos = cos.unsqueeze(-2)
-        sin = sin.unsqueeze(-2)
-        x1, x2 = torch.chunk(x, 2, dim=-1)
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return torch.cat((o1, o2), dim=-1)
-
-    def forward(self, query: torch.Tensor, key: torch.Tensor):
-        num_tokens = query.shape[0]
-        cos, sin = self._compute_cos_sin(num_tokens)
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_dim)
-        query = self._apply_rotary_emb(query, cos, sin)
-        query = query.reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_dim)
-        key = self._apply_rotary_emb(key, cos, sin)
-        key = key.reshape(key_shape)
-        return query, key
+    def forward(self, x_BTHD):
+        assert self.cos.size(0) >= x_BTHD.size(-3)
+        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
+        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
+        y1 = x1 * cos + x2 * sin
+        y2 = x1 * (-sin) + x2 * cos
+        return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
@@ -118,7 +64,7 @@ class AttentionOnDetail(nn.Module):
         self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
         self.out = CastedLinear(config.n_embd, config.n_embd)
-        self.rotary = Rotary(config)
+        self.rotary = Rotary(self.d_head, config.block_size)
 
     def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)

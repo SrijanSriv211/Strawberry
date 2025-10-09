@@ -76,7 +76,7 @@ def init_model(checkpoint=None):
 	# load hyperparams
 	hyperparams = dict()
 	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["vocab_size", "block_size", "n_layer", "d_layer", "n_head", "n_embd", "d_rank", "d_qkv"]:
+	for k in ["vocab_size", "block_size", "r_layer", "n_layer", "n_head", "n_embd", "n_qkv"]:
 		hyperparams[k] = CONFIG[k]
 
 	# create an instance of Strawberry
@@ -264,13 +264,13 @@ def save_checkpoint(model, optimizer):
 	if CONFIG["checkpoints"] == None or stats["steps"] <= 0 or stats["steps"] % CONFIG["checkpoints"]["interval"] != 0: return
 	if not os.path.isdir(CONFIG["checkpoints"]["path"]): os.mkdir(CONFIG["checkpoints"]["path"])
 	print0(f"saved checkpoint at step {Fore.WHITE}{Style.BRIGHT}{stats["steps"]}")
-	torch.save(get_trained_model(model, optimizer), f"{CONFIG["checkpoints"]["path"]}/s{stats["steps"]}.bin")
+	torch.save(get_trained_model(model, optimizer), f"{CONFIG["checkpoints"]["path"]}/step{stats["steps"]}.bin")
 
 # generate some sample text
 def sample_output(model, optimizer):
 	if CONFIG["sample_interval"] == None or stats["steps"] <= 0 or stats["steps"] % CONFIG["sample_interval"] != 0: return
 	out = generate(get_trained_model(model, optimizer), CONFIG["encoder_path"], l=CONFIG["block_size"], T=[None])
-	print0(f"{Fore.WHITE}{Style.DIM}```s{stats["steps"]}.bin\n{out}\n```")
+	print0(f"{Fore.WHITE}{Style.DIM}```step{stats["steps"]}.bin\n{out}\n```")
 
 # evaluate the loss on train/val sets
 def log_eval_loss():
