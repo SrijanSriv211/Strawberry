@@ -1,9 +1,6 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, math
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+import torch.nn as nn, torch
 
 @dataclass
 class Config:
@@ -14,6 +11,19 @@ class Config:
     n_head: int = 4
     n_embd: int = 64
     n_qkv: int = 256
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+def apply_rotary_emb(x, cos, sin):
+    assert x.ndim == 4  # multihead attention
+    d = x.shape[3] // 2
+    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+    y1 = x1 * cos + x2 * sin # rotate pairs of dims
+    y2 = x1 * (-sin) + x2 * cos
+    out = torch.cat([y1, y2], 3) # re-assemble
+    out = out.to(x.dtype) # ensure input/output dtypes match
+    return out
 
 class CastedLinear(nn.Module):
     def __init__(self, in_features, out_features):
@@ -35,25 +45,6 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.w)
 
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
-        super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos(), persistent=False)
-        self.sin = nn.Buffer(theta.sin(), persistent=False)
-
-    def forward(self, x_BTHD):
-        assert self.cos.size(0) >= x_BTHD.size(-3)
-        cos, sin = self.cos[None, :x_BTHD.size(-3), None, :], self.sin[None, :x_BTHD.size(-3), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x_BTHD)
-
 class AttentionOnDetail(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -64,25 +55,29 @@ class AttentionOnDetail(nn.Module):
         self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
         self.out = CastedLinear(config.n_embd, config.n_embd)
-        self.rotary = Rotary(self.d_head, config.block_size)
 
-    def forward(self, x):
+        # zero out c_proj weights in all blocks
+        torch.nn.init.zeros_(self.out.w)
+
+    def forward(self, x, cos_sin):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(norm(x)).view(B, T, 3*self.n_head, self.d_head).transpose(1, 2).chunk(3, dim=1) # (B, T, nh, hs) -> (B, nh, T, hs)
+        q, k, v = self.qkv(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        # apply rotary embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
         q, k = norm(q), norm(k) # QK norm
-        q, k = self.rotary(q, k)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
 
         # https://arxiv.org/pdf/2105.14103
         y = torch.sigmoid(q) * torch.cumsum(torch.sigmoid(k) * v, dim=2)
-        y = y.transpose(1, 2).contiguous().view(B, T, self.n_head*self.d_head) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
 
         # output projection
         u, v = self.swiglu(y).chunk(2, dim=-1)
-        x + self.out(u * F.silu(v))
-        return F.relu(x).square()
+        return x + self.out(u * F.silu(v))
 
 class Strawberry(nn.Module):
     def __init__(self, config: Config):
@@ -96,19 +91,45 @@ class Strawberry(nn.Module):
         self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer)])
         self.unembed = CastedLinear(config.n_embd, config.vocab_size)
 
+        # to support meta device initialization, we init the rotary embeddings here, but it's fake
+        # as for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
+        # so let's just over-compute them, but assert fail if we ever reach that amount.
+        # in the future we can dynamically grow the cache, for now it's fine.
+        self.rotary_block_size = config.block_size * 10 # 10X over-compute should be enough, TODO make nicer?
+        d_head = config.n_qkv // config.n_head
+        self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_block_size, d_head)
+
+        # zero out classifier weights
+        torch.nn.init.zeros_(self.unembed.w)
+
+    def _precompute_rotary_embeddings(self, block_size, d_head, base=10000):
+        # stride the channels
+        channel_range = torch.arange(0, d_head, 2)
+        inv_freq = 1.0 / (base ** (channel_range / d_head))
+        # stride the time steps
+        t = torch.arange(block_size)
+        # calculate the rotation frequencies at each (time, channel) pair
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
+        return cos, sin
+
     def forward(self, idx, targets=None):
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
 
-        x = norm(self.embed(idx)) # token embeddings of shape (b, t, n_embd)
+        # grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        cos_sin = self.cos[:, :+T], self.sin[:, :+T]
 
+        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
+        x = norm(x)
         for _ in range(self.config.r_layer):
             for block in self.blocks:
-                x = block(x)
-
-        logits = self.unembed(norm(x))
+                x = block(x, cos_sin)
+        x = norm(x)
+        logits = self.unembed(x)
         # if we are given some desired targets also calculate the loss
-        loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction="mean")
         return logits, loss
 
     @torch.no_grad()
