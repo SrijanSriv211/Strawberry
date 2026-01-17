@@ -1,0 +1,13 @@
+[project]
+name = "strawberry"
+version = "1.0.0"
+description = "Is strawberry a fruit or a vegetable?"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "colorama>=0.4.6",
+    "numpy>=2.4.1",
+    "regex>=2026.1.15",
+    "rich>=14.2.0",
+    "torch>=2.9.1",
+]
