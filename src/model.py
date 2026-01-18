@@ -11,6 +11,8 @@ class Config:
     n_head: int = 4
     n_embd: int = 64
     n_qkv: int = 256
+    n_experts: int = 4
+    experts_per_tok: int = 2
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -43,26 +45,35 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.weight)
 
-class AttentionOnDetail(nn.Module):
+# new version of the old AttentionOnDetail
+class TheExpertAbundance(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.d_head = config.n_qkv // config.n_head
         self.n_head = config.n_head
 
+        # experts
+        self.experts_per_tok = config.experts_per_tok
+        self.n_experts = config.n_experts
+        self.gate = CastedLinear(config.n_embd, self.n_experts)
+
         # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
+        self.qkv_1 = CastedLinear(config.n_embd, 3*config.n_qkv)
+        self.qkv_2 = CastedLinear(self.d_head, 3*self.d_head)
+
+        # out projection weights
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
         self.out = CastedLinear(config.n_embd, config.n_embd)
 
-        # zero out c_proj weights in all blocks
+        # zero out projection weights in all blocks
         torch.nn.init.zeros_(self.out.weight)
 
     def forward(self, x, cos_sin):
         # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
+        B, T, _ = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv_1(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
 
         # apply rotary embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -71,7 +82,13 @@ class AttentionOnDetail(nn.Module):
 
         # make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        # # calculate AFT attention
+        # y = torch.softmax(q) * torch.cumsum(torch.softmax(k) * v, dim=2) # https://arxiv.org/pdf/2105.14103
+
+        # calculate sdpa
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
 
         # output projection
@@ -87,7 +104,7 @@ class Strawberry(nn.Module):
 
         # factorized token embeddings
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = nn.ModuleList([AttentionOnDetail(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([TheExpertAbundance(config) for _ in range(config.n_layer)])
 
         # to support meta device initialization, we init the rotary embeddings here, but it's fake
         # as for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
