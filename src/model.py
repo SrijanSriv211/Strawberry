@@ -45,6 +45,37 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.weight)
 
+# perform a compaction computation on input to make it batch-size & block-size independent
+#! WARNING: THIS TING IS UNTESTED
+class CompactCompute(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.n_embd = config.n_embd
+
+        # original, adjust, transform
+        self.oa = CastedLinear(self.n_embd, 2*self.n_embd)
+        self.t = CastedLinear(self.n_embd, self.n_embd)
+
+    def forward(self, x, cos_sin):
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        o, a = self.oa(norm(x)).view(B*T, 2*C).chunk(2, dim=-1) # (B*T, C)
+
+        # apply rotary embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        o, a = apply_rotary_emb(o, cos, sin), apply_rotary_emb(a, cos, sin) # OA rotary embedding
+        o, a = norm(o), norm(a) # OA norm
+
+        # perform a calculation similar to attention
+        y = o.T @ a
+        y = y / torch.sqrt(self.n_embd)
+        y = torch.pi * F.tanh(y) # (C, C)
+        y = self.t(y)
+        y = y.view(1, self.n_embd, self.n_embd) # (B, T, C) -> (1, C, C)
+        return y, (B, T, C)
+
 # new version of the old AttentionOnDetail
 class TheExpertAbundance(nn.Module):
     def __init__(self, config: Config):
@@ -58,8 +89,7 @@ class TheExpertAbundance(nn.Module):
         self.gate = CastedLinear(config.n_embd, self.n_experts)
 
         # merged QKV weights
-        self.qkv_1 = CastedLinear(config.n_embd, 3*config.n_qkv)
-        self.qkv_2 = CastedLinear(self.d_head, 3*self.d_head)
+        self.qkv = CastedLinear(config.n_embd, 2*config.n_qkv)
 
         # out projection weights
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
@@ -73,21 +103,20 @@ class TheExpertAbundance(nn.Module):
         B, T, _ = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv_1(norm(x)).view(B, T, 3*self.n_head, self.d_head).chunk(3, dim=2) # (B, T, nh, hs)
+        qk, v = self.qkv(norm(x)).view(B, T, 2*self.n_head, self.d_head).chunk(2, dim=2) # (B, T, nh, hs)
 
         # apply rotary embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
+        qk = norm(apply_rotary_emb(qk, cos, sin)) # QK rotary embedding & norm
 
         # make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        qk, v = qk.transpose(1, 2), v.transpose(1, 2)
 
         # # calculate AFT attention
         # y = torch.softmax(q) * torch.cumsum(torch.softmax(k) * v, dim=2) # https://arxiv.org/pdf/2105.14103
 
         # calculate sdpa
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = torch.nn.functional.scaled_dot_product_attention(qk, v, v, attn_mask=None, is_causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
 
