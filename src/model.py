@@ -6,13 +6,13 @@ import torch.nn as nn, torch
 class Config:
     vocab_size: int = 8192
     block_size: int = 1024
-    r_layer: int = 2 # num reuse layers
-    n_layer: int = 2 # num new layers
+    r_layer: int = 2 # reuse layers
+    n_layer: int = 2 # new layers
     n_head: int = 4
     n_embd: int = 64
     n_qkv: int = 256
-    n_experts: int = 4
-    experts_per_tok: int = 2
+    n_experts: int = 4 # total experts
+    a_experts: int = 2 # active experts
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -84,12 +84,12 @@ class TheExpertAbundance(nn.Module):
         self.n_head = config.n_head
 
         # experts
-        self.experts_per_tok = config.experts_per_tok
+        self.a_experts = config.a_experts
         self.n_experts = config.n_experts
-        self.gate = CastedLinear(config.n_embd, self.n_experts)
+        # self.gate = CastedLinear(config.n_embd, self.n_experts)
 
         # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 2*config.n_qkv)
+        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
 
         # out projection weights
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
@@ -103,22 +103,23 @@ class TheExpertAbundance(nn.Module):
         B, T, _ = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qk, v = self.qkv(norm(x)).view(B, T, 2*self.n_head, self.d_head).chunk(2, dim=2) # (B, T, nh, hs)
+        q, k, v = self.qkv(norm(x)).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
 
         # apply rotary embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
-        qk = norm(apply_rotary_emb(qk, cos, sin)) # QK rotary embedding & norm
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
+        q, k = norm(q), norm(k) # QK norm
 
         # make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
-        qk, v = qk.transpose(1, 2), v.transpose(1, 2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # # calculate AFT attention
-        # y = torch.softmax(q) * torch.cumsum(torch.softmax(k) * v, dim=2) # https://arxiv.org/pdf/2105.14103
+        # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
+        q = torch.softmax(q, dim=2)
+        k = torch.softmax(k, dim=2)
+        v = q * torch.cumsum(k * v, dim=2)
 
         # calculate sdpa
-        y = torch.nn.functional.scaled_dot_product_attention(qk, v, v, attn_mask=None, is_causal=True)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
+        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
         # output projection
         u, v = self.swiglu(y).chunk(2, dim=-1)

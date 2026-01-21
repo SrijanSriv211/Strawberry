@@ -20,10 +20,8 @@
 ```
 X           -> Linear                                               -> QKV
 Q, K        -> Rotary embeddings                                    -> Q, K
-Q, K, V     -> Full/Global AFT                                      -> Y
-Y           -> Linear                                               -> QKV
-Q, K        -> Rotary embeddings                                    -> Q, K
-Q, K, V     -> Local, Mixture of Scaled Dot Product Attention       -> Y
+Q, K, V     -> Full/Global AFT                                      -> V'
+Q, K, V'    -> Local, Mixture of Scaled Dot Product Attention       -> Y
 Y           -> Concatenate all local mixture of attention parts     -> Y
 Y           -> Swiglu                                               -> Y
 Y           -> X + Y                                                -> Y
