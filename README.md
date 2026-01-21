@@ -3,9 +3,11 @@
 - It is built on top of [Palm](https://github.com/SrijanSriv211/Palm)
 - It brings several improvements over the standard Transformer architecture, such as:
     1. Share stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
-    2. Modernized architecture: Rotary embeddings and QK-Norm
-    3. MoE based attention mechanisms `The Expert Abundance`
-    4. A new `Compaction Compute` layer which makes the entire architecture independent of batch-size and context-length
+    2. Modern architecture: Rotary embeddings and QK-Norm
+    3. Share embedding weight
+    4. MoE based attention mechanism `The Expert Abundance`
+    5. `Compaction Compute` layer makes the entire architecture independent of batch-size and context-length
+- `Strawberry s1` model based on this architecutre. **COMING SOON**
 
 ## The Expert Abundance
 
@@ -13,9 +15,7 @@
 
 - [Multi-Headed Causal Self-Attention (MHA)](https://arxiv.org/pdf/1706.03762)
 - [Attention Free Transformer (AFT)](https://arxiv.org/pdf/2105.14103)
-- [Key-Value Transformer](https://arxiv.org/pdf/2305.19129)
 - [SwiGLU](https://arxiv.org/pdf/2002.05202)
-- [MoE](https://arxiv.org/pdf/2507.11181)
 
 ```
 X           -> Linear                                               -> QKV
