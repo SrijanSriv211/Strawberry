@@ -1,397 +1,361 @@
-from model import Config, Strawberry
-from sample import generate
+from utils import calc_total_time, print_banner, print0
+from model import Strawberry, Config
+from encoder import Encoder
 from optimizer import Muon
+
 from colorama import Style, Fore, init
 from rich.progress import track
-import random, torch, regex, numpy, json, time, math, sys, os
+from itertools import chain
 
-# initialization
-init(autoreset=True)
+import random, pickle, torch, json, time, math, sys, os
+
 torch._inductor.config.coordinate_descent_tuning = True
 torch._dynamo.config.compiled_autograd = True
+init(autoreset=True)
 
 # load config
-CONFIG_PATH = sys.argv[1] if len(sys.argv) > 1 else "script/config.json"
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-	CONFIG = json.load(f)
+CONFIG = json.loads(open(sys.argv[1], "r", encoding="utf-8").read()) if len(sys.argv) > 1 else {
+	"dataset": {
+        "data_division": 0.8,
+		"load_from_file": True,
+		"path": "data/webtext.bin"
+	},
+	"checkpoints": {
+		"path": "bin/ck",
+		"interval": 2000,
+        "create_checkpoints": True
+	},
+    "model_hyperparams": {
+        "vocab_size": 8192,
+        "block_size": 256,
+        "r_layer": 2,
+        "n_layer": 2,
+        "n_head": 4,
+        "n_embd": 64,
+        "n_qkv": 256
+    },
+    "optimizer_hyperparams": {
+        "eps": 1e-10,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "weight_decay": 1e-1,
+    	"use_muon": False,
+        "momentum": 0.95
+    },
+	"model_path": "bin/air.strawberry",
+	"encoder_path": "bin/cl8k.bin",
+	"init_from": "scratch",
+    "seed": "auto",
 
-# set device
-device = ("cuda" if torch.cuda.is_available() else "cpu") if CONFIG["device"] == "auto" else CONFIG["device"]
+	"gradient_accumulation_steps": 1,
+	"batch_size": 4,
+
+	"max_iters": 50000,
+	"eval_interval": 2000,
+	"log_interval": 200,
+	"eval_iters": 200,
+	"sample_interval": 2000,
+
+	"decay_lr": True,
+	"lr_decay_iters": 50000,
+	"learning_rate": 3e-3,
+	"cooldown_frac": 0.4,
+	"warmup_iters": 2000,
+	"min_lr": 3e-4
+}
 
 # init seed
 if CONFIG["seed"] != "auto":
-	torch.manual_seed(CONFIG["seed"])
-	numpy.random.seed(CONFIG["seed"])
-	random.seed(CONFIG["seed"])
+    torch.manual_seed(CONFIG["seed"])
+    random.seed(CONFIG["seed"])
 
-# save the text in a text file
-ansi_escape = regex.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
-def print0(*text, println=True, overwrite=False, save_to_file=True):
-	if println:
-		print(*text)
+if CONFIG["checkpoints"]["create_checkpoints"] and not os.path.isdir(CONFIG["checkpoints"]["path"]):
+    os.mkdir(CONFIG["checkpoints"]["path"])
 
-	if not save_to_file:
-		return
+# set device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+init_from = CONFIG["init_from"][11:] if CONFIG["init_from"].startswith("pretrained,") else "scratch"
 
-	# save cleaned text to the file
-	if not os.path.isdir(CONFIG["checkpoints"]["path"]):
-		os.mkdir(CONFIG["checkpoints"]["path"])
+# print the device
+print_banner()
+print0(f"config: {Fore.WHITE}{Style.DIM}`{json.dumps(CONFIG)}`", overwrite=(init_from == "scratch"))
+print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}")
 
-	with open(os.path.join(CONFIG["checkpoints"]["path"], "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
-		f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
+# load stats
+checkpoint = None if init_from == "scratch" else torch.load(init_from)
+stats = checkpoint["stats"] if checkpoint is not None and "stats" in checkpoint.keys() else {
+    "step": 0,
+    "loss": {
+        "train": [],
+        "test": [],
+        "val": []
+    },
+    "lr": []
+}
 
-def calc_total_time(seconds):
-    # separate the integer part (for hours, minutes, and seconds) from the fractional part (for milliseconds)
-    sec_int, millis = divmod(seconds, 1)
-    millis = int(millis * 1000) # convert the fractional part to milliseconds
+# create an instance of Strawberry
+hyperparams = CONFIG["model_hyperparams"] if checkpoint is None else checkpoint["hyperparams"]
+conf = Config(**hyperparams)
+model = Strawberry(conf)
 
-    min, sec = divmod(int(sec_int), 60)
-    hour, min = divmod(min, 60)
-    hours, minutes, seconds = int(hour), int(min), int(sec)
-
-    t = [
-        f"{hours} hour" + ("s" if hours > 1 else "") if hours > 0 else None,
-        f"{minutes} minute" + ("s" if minutes > 1 else "") if minutes > 0 else None,
-        f"{seconds} second" + ("s" if seconds > 1 else "") if seconds > 0 else None,
-        f"{millis} ms" if millis > 0 else None
-    ]
-    t = list(filter(None, t))
-
-    return ", ".join(t) if t else "0 seconds"
-
-def init_model(checkpoint=None):
-	# print the device
-	print0(f"```config.json\n{json.dumps(CONFIG, indent=4)}\n```", println=False, overwrite=True if checkpoint is None else False)
-	print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}")
-
-	# load stats
-	stats = checkpoint["stats"] if checkpoint is not None and "stats" in checkpoint.keys() else {
-		"steps": 0,
-		"train": [],
-		"eval": [],
-		"val": [],
-		"lr": []
-	}
-
-	# load hyperparams
-	hyperparams = dict()
-	# read off the created CONFIG params, so we can store them into checkpoint correctly
-	for k in ["vocab_size", "block_size", "r_layer", "n_layer", "n_head", "n_embd", "n_qkv"]:
-		hyperparams[k] = CONFIG[k]
-
-	# create an instance of Strawberry
-	conf = Config(**hyperparams)
-	model = Strawberry(conf)
-	# load the state dict
-	if checkpoint is not None:
-		model.load_state_dict(checkpoint["model"])
-	model.to(device)
-
-	return model, hyperparams, stats
+# load the state dict
+if checkpoint is not None:
+    model.load_state_dict(checkpoint["model"])
+model.to(device)
 
 # optimizers!
-def configure_optimizers(model: Strawberry, checkpoint=None):
-	# collect the parameters to optimize
-	hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-	embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-	adam_params = embed_params
+optimizer_hyperparams = CONFIG["optimizer_hyperparams"] if checkpoint is None else checkpoint["optimizer_hyperparams"]
 
-	if not CONFIG["use_muon"]:
-		adam_params = adam_params + hidden_matrix_params
+# collect the parameters to optimize
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+adam_params = embed_params
 
-	# init the optimizer(s)
-	# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
-	# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-	optimizer1 = torch.optim.AdamW(
-		adam_params, lr=CONFIG["learning_rate"], betas=(CONFIG["beta1"], CONFIG["beta2"]),
-		eps=CONFIG["eps"], weight_decay=CONFIG["weight_decay"], fused=True
-	)
-	optimizers = [optimizer1]
+if not optimizer_hyperparams["use_muon"]:
+    adam_params = embed_params + hidden_matrix_params
 
-	if CONFIG["use_muon"]:
-		optimizer2 = Muon(hidden_matrix_params, lr=CONFIG["learning_rate"], momentum=CONFIG["momentum"], weight_decay=CONFIG["weight_decay"])
-		optimizers.append(optimizer2)
+# init the optimizer(s)
+# small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
+# discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
+optimizer1 = torch.optim.AdamW(
+    adam_params, lr=CONFIG["learning_rate"], betas=(optimizer_hyperparams["beta1"], optimizer_hyperparams["beta2"]),
+    eps=optimizer_hyperparams["eps"], weight_decay=optimizer_hyperparams["weight_decay"], fused=True
+)
+optimizers = [optimizer1]
 
-	# load optimizer(s) state dict if loading from checkpoint
-	if checkpoint is not None:
-		for o, s in zip(optimizers, checkpoint["optimizers"]):
-			o.load_state_dict(s)
-	return optimizers
+if optimizer_hyperparams["use_muon"]:
+    optimizer2 = Muon(
+        hidden_matrix_params,
+        lr=CONFIG["learning_rate"],
+        momentum=optimizer_hyperparams["momentum"],
+        weight_decay=optimizer_hyperparams["weight_decay"]
+    )
+    optimizers.append(optimizer2)
 
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-	if not CONFIG["decay_lr"]:
-		return CONFIG["learning_rate"]
+# load optimizer(s) state dict if loading from checkpoint
+if checkpoint is not None:
+    for o, s in zip(optimizers, checkpoint["optimizers"]):
+        o.load_state_dict(s)
 
-	# 1) linear warmup for warmup_iters steps
-	elif it < CONFIG["warmup_iters"]:
-		return CONFIG["learning_rate"] * (it + 1) / (CONFIG["warmup_iters"] + 1)
+class dataloader:
+    def __init__(self, path, block_size, batch_size, sink_tok, mask_tok, data_division=0.8, isfile=True):
+        self.path = path
+        self.data_division = data_division
+        self.sink_tok, self.mask_tok = sink_tok, mask_tok
+        self.block_size, self.batch_size = block_size, batch_size
+        self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
 
-	# 2) constant learning rate for some time
-	elif it / CONFIG["lr_decay_iters"] <= 1 - CONFIG["cooldown_frac"]:
-		return CONFIG["learning_rate"]
+    def load_dataset(self):
+        self.train, self.val = [], []
 
-	# 3) if it > lr_decay_iters, return min learning rate
-	elif it > CONFIG["lr_decay_iters"]:
-		return CONFIG["min_lr"]
+        for file in self.files:
+            with open(file, "rb") as f:
+                dataset = pickle.load(f)["dataset"]
 
-	# 4) in between, use cosine decay down to min learning rate
-	const_lr_iters = int((1 - CONFIG["cooldown_frac"]) * CONFIG["lr_decay_iters"])
-	decay_ratio = (it - const_lr_iters) / (CONFIG["lr_decay_iters"] - const_lr_iters)
+            flat_dataset = chain.from_iterable(dataset)
+            del dataset
 
-	assert 0 <= decay_ratio <= 1
-	coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
-	return CONFIG["min_lr"] + coeff * (CONFIG["learning_rate"] - CONFIG["min_lr"])
+            flat_dataset = list(flat_dataset)
+            n_train_toks = int(len(flat_dataset) * self.data_division)
+            n_val_toks = len(flat_dataset) - n_train_toks
+
+            self.train.extend(flat_dataset[:n_train_toks])
+            self.val.extend(flat_dataset[n_train_toks:])
+
+        random.shuffle(self.train)
+        random.shuffle(self.val)
+        self.train = torch.tensor(self.train, dtype=torch.int16)
+        self.val = torch.tensor(self.val, dtype=torch.int16)
+        return n_train_toks, n_val_toks
+
+    def next_batch(self, split):
+        data = self.train if split == "train" else self.val
+
+        ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
+        batch = torch.stack([data[i:i + self.block_size] for i in ix])
+
+        sink_col = torch.full((self.batch_size, 1), self.sink_tok, dtype=batch.dtype, device=batch.device)
+        mask_col = torch.full((self.batch_size, 1), self.mask_tok, dtype=batch.dtype, device=batch.device)
+
+        x = torch.cat([sink_col, batch[:, :-1], mask_col], dim=1) # x: prepend SINK, drop last token, append MASK
+        y = torch.cat([sink_col, batch], dim=1) # y: prepend SINK, keep full sequence
+
+        x, y = x.to(device), y.to(device)
+        return x, y, batch
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss(model, get_batch):
+def estimate_loss(model, next_batch):
 	out = {}
 	model.eval()
 	for split in ["train", "val"]:
 		losses = torch.zeros(CONFIG["eval_iters"])
 		for k in track(range(CONFIG["eval_iters"]), description=f"{Fore.WHITE}{Style.BRIGHT}calc {Fore.WHITE}{Style.DIM}{split} loss{Style.RESET_ALL}"):
-			X, Y = get_batch(split)
+			X, Y, _ = next_batch(split)
 			_, loss = model(X, Y)
-
 			losses[k] = loss.item()
 		out[split] = losses.mean()
 	model.train()
 	return out
 
-class dataloader:
-	def __init__(self, path, isfile=True, t_in_mem=50_000_000, exhaust_pool=True):
-		self.path = path
-		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
-		self.orig_files = self.files[:]
-		self.t_in_mem = t_in_mem # tokens in memory
-		self.exhaust_pool = exhaust_pool
-
-	# get total number of tokens
-	def get_tok_count(self, orig=True):
-		files = self.orig_files if orig else self.files
-		return sum([numpy.memmap(f, dtype=numpy.int16, mode="r").size for f in files])
-
-	def load_dataset(self):
-		if len(self.files) <= 0 or self.get_tok_count(False) < self.t_in_mem:
-			self.files = self.orig_files[:]
-
-		self.data = []
-		for f in random.sample(self.files, k=len(self.files)):
-			self.data.extend(numpy.memmap(f, dtype=numpy.int16, mode="r"))
-			self.files.remove(f) # remove file until the next epoch
-
-			if self.t_in_mem is not None and round(len(self.data) / self.t_in_mem, 1) >= 0.8:
-				break
-
-		block_size = CONFIG["block_size"] + 1
-		self.data = self.data[:len(self.data) // block_size * block_size]
-		self.data = numpy.array(self.data, dtype=numpy.int16).reshape(-1, block_size)
-		self.data = torch.from_numpy(self.data.astype(numpy.int64))
-		self.batches = torch.randperm(self.data.shape[0]) if self.exhaust_pool else None
-		self.ptr = 0
-
-	def next_batch(self):
-		if self.ptr + CONFIG["batch_size"] > self.data.shape[0]:
-			self.load_dataset()
-
-		# get x, y batches
-		# sample data without replacement during training (until an epoch boundary is reached) is minimize overfitting.
-		if self.exhaust_pool:
-			ix = self.batches[self.ptr:self.ptr + CONFIG["batch_size"]]
-			self.ptr += CONFIG["batch_size"]
-
-		else:
-			ix = torch.randint(self.data.shape[0], (CONFIG["batch_size"],))
-
-		data = self.data[ix]
-		x = data[:, :CONFIG["block_size"]].contiguous()
-		y = data[:, 1:1+CONFIG["block_size"]].contiguous()
-		x, y = x.to(device), y.to(device)
-		return x, y
-
-# init model and optimizers
-init_from = torch.load(CONFIG["init_from"][11:]) if CONFIG["init_from"].startswith("pretrained,") else None
-model, hyperparams, stats = init_model(init_from)
-optimizers = configure_optimizers(model, init_from)
-
-# load train and val data
-train_data_loader = dataloader(CONFIG["train_data"], CONFIG["load_from_file"])
-val_data_loader = dataloader(CONFIG["val_data"], CONFIG["load_from_file"], exhaust_pool=False)
-train_data_loader.load_dataset()
-val_data_loader.load_dataset()
-# simple lambda function for `estimate_loss` function
-get_batch = lambda x: train_data_loader.next_batch() if x == "train" else val_data_loader.next_batch()
-
-# print the number of tokens
-num_train_toks = train_data_loader.get_tok_count()
-num_val_toks = val_data_loader.get_tok_count()
-print0(f"{Fore.WHITE}{Style.BRIGHT}{((num_train_toks + num_val_toks)/1e6)}M", "total tokens")
-print0(
-	f"{Fore.WHITE}{Style.BRIGHT}{(num_train_toks/1e6)}M", "train tokens,", f"{Fore.WHITE}{Style.BRIGHT}{(num_val_toks/1e6)}M", "val tokens",
-	f"   {Fore.WHITE}{Style.DIM}(using train tokens as val tokens)" if CONFIG["train_data"] == CONFIG["val_data"] else ""
-)
-del num_train_toks, num_val_toks
-
-# report number of parameters
-print0(f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters")
-
-# compile the model
-if CONFIG["compile"]:
-	print0(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
-	model = torch.compile(model) # requires PyTorch 2.0
-
-# training loop
-start_time = eval_t0 = t0 = time.time()
-
-def get_trained_model(model: Strawberry, optimizers: list[torch.optim.AdamW, Muon]):
+def get_state(model: Strawberry, optimizers: list[torch.optim.AdamW, Muon]):
 	state_dict = model.state_dict()
 	unwanted_prefix = '_orig_mod.'
+
 	for k, v in list(state_dict.items()):
 		if k.startswith(unwanted_prefix):
 			state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
 
 	return {
-		"model": state_dict,
-		"optimizers": [o.state_dict() for o in optimizers],
-		"hyperparams": hyperparams,
+		"stats": stats,
 		"device": device,
-		"stats": stats
+		"model": state_dict,
+		"hyperparams": hyperparams,
+        "optimizer_hyperparams": optimizer_hyperparams,
+		"optimizers": [o.state_dict() for o in optimizers]
 	}
 
-# write checkpoints
-def save_checkpoint(model, optimizer):
-	if CONFIG["checkpoints"] == None or stats["steps"] <= 0 or stats["steps"] % CONFIG["checkpoints"]["interval"] != 0: return
-	if not os.path.isdir(CONFIG["checkpoints"]["path"]): os.mkdir(CONFIG["checkpoints"]["path"])
-	print0(f"saved checkpoint at step {Fore.WHITE}{Style.BRIGHT}{stats["steps"]}")
-	torch.save(get_trained_model(model, optimizer), f"{CONFIG["checkpoints"]["path"]}/step{stats["steps"]}.bin")
+# load encoder
+enc = Encoder()
+enc.load(CONFIG["encoder_path"])
+sink_tok, mask_tok = enc.special_tokens["<|sink|>"], enc.special_tokens["<|mask|>"]
 
-# generate some sample text
-def sample_output(model, optimizer):
-	if CONFIG["sample_interval"] == None or stats["steps"] <= 0 or stats["steps"] % CONFIG["sample_interval"] != 0: return
-	out = generate(get_trained_model(model, optimizer), CONFIG["encoder_path"], l=CONFIG["block_size"], T=[None])
-	print0(f"{Fore.WHITE}{Style.DIM}```step{stats["steps"]}.bin\n{out}\n```")
+# load dataset
+dataset = dataloader(
+    CONFIG["dataset"]["path"],
+    hyperparams["block_size"], CONFIG["batch_size"], sink_tok, mask_tok,
+    CONFIG["dataset"]["data_division"], CONFIG["dataset"]["load_from_file"]
+)
+n_train_toks, n_val_toks = dataset.load_dataset()
 
-# evaluate the loss on train/val sets
-def log_eval_loss():
-	if stats["steps"] <= 0 or stats["steps"] % CONFIG["eval_interval"] != 0:
-		return
-	global eval_t0
+print0(f"{Fore.WHITE}{Style.BRIGHT}{((n_train_toks + n_val_toks)/1e6)}M", "total tokens")
+print0(
+	f"{Fore.WHITE}{Style.BRIGHT}{(n_train_toks/1e6)}M", "train tokens,",
+    f"{Fore.WHITE}{Style.BRIGHT}{(n_val_toks/1e6)}M", "val tokens"
+)
 
-	# timing and logging
-	losses = estimate_loss(model, get_batch)
-	eval_t1 = time.time()
-	eval_dt = eval_t1 - eval_t0
-	eval_t0 = eval_t1
-	print0(
-		f"{Fore.WHITE}{Style.BRIGHT}step",
-		f"{Fore.WHITE}{Style.DIM}[{stats["steps"]}/{CONFIG["max_iters"]}]"
-		f"{Fore.RESET}{Style.RESET_ALL}:",
-		f"train loss {Fore.WHITE}{Style.BRIGHT}{losses["train"]:.4f}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"val loss {Fore.WHITE}{Style.BRIGHT}{losses["val"]:.4f}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"lr {Fore.WHITE}{Style.BRIGHT}{lr:.7f}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}"
-	)
-	stats["train"].append(losses["train"])
-	stats["val"].append(losses["val"])
+# report number of parameters
+print0(f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters")
 
-def log_loss():
-	if stats["steps"] % CONFIG["log_interval"] != 0:
-		return
-	global t0
+# compile the model
+print0(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
+model = torch.compile(model)
 
-	# timing and logging
-	t1 = time.time()
-	dt = t1 - t0
-	t0 = t1
-
-	# get loss as float. note: this is a CPU-GPU sync point
-	# scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-	lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
-
-	toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"] * CONFIG["log_interval"]) / dt
-	print0(
-		f"{Fore.WHITE}{Style.BRIGHT}iter",
-		f"{Fore.WHITE}{Style.DIM}[{stats["steps"]}/{CONFIG["max_iters"]}]"
-		f"{Fore.RESET}{Style.RESET_ALL}:",
-		f"loss {Fore.WHITE}{Style.BRIGHT}{lossf:.4f}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"dt {Fore.WHITE}{Style.DIM}{calc_total_time(dt)}"
-		f"{Fore.RESET}{Style.RESET_ALL},",
-		f"tok/s {Fore.WHITE}{Style.DIM}{toks_per_sec:.2f}"
-	)
-	stats["eval"].append(lossf)
-
-# forward backward update, with optional gradient accumulation to simulate larger batch size
-# and using the GradScaler if data type is float16
-def train_model():
-	global optimizers, model, get_batch
-	for _ in range(CONFIG["gradient_accumulation_steps"]):
-		# immediately async prefetch next batch while model is doing the forward pass on the GPU
-		X, Y = get_batch("train")
-
-		_, loss = model(X, Y)
-		loss = loss / CONFIG["gradient_accumulation_steps"] # scale the loss to account for gradient accumulation
-
-		# backward pass, with gradient scaling if training in fp16
-		loss.backward()
-
-	# clip the gradient
-	if CONFIG["grad_clip"] != 0.0:
-		torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
-
-	if CONFIG["use_muon"]:
-		for group in optimizers[1].param_groups:
-			frac = min(stats["steps"] / 300, 1) # momentum warmup for muon
-			group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-
-	# step the optimizers and scaler if training in fp16
-	for o in optimizers:
-		o.step()
-
-	# flush the gradients as soon as we can, no need for this memory anymore
-	optimizers[0].zero_grad(set_to_none=True)
-	model.zero_grad(set_to_none=True)
-	return loss
-
-# warmup the training kernels
-print0(f"warming up training kernels... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
-init_from_pretrained = CONFIG["init_from"].startswith("pretrained,") and stats["steps"] > 0
-for i in range(stats["steps"] if init_from_pretrained else 10):
-	if not init_from_pretrained:
-		train_model()
-		continue
-
-	if i >= 0 and i % CONFIG["eval_interval"] == 0:
-		[get_batch(split) for split in ["train", "val"] for _ in range(CONFIG["eval_iters"])]
-	get_batch("train")
-
+# training loop
 # start training the model
 print0("started training")
-n_steps = CONFIG["max_iters"] - stats["steps"]
+start_time, eval_t0, test_t0 = time.time()
+n_steps = CONFIG["max_iters"] - stats["step"]
+
 for _ in range(n_steps):
 	# determine and set the learning rate for this iteration
-	lr = get_lr(stats["steps"])
-	for o in optimizers:
-		for group in o.param_groups:
-			group["lr"] = lr
-	stats["lr"].append(lr)
+    ## learning rate decay scheduler (cosine with warmup)
+    if not CONFIG["decay_lr"]:
+        lr = CONFIG["learning_rate"]
 
-	# validation section
-	# save checkpoint and log sample and eval loss
-	save_checkpoint(model, optimizers)
-	sample_output(model, optimizers)
-	log_eval_loss()
+    ## 1) linear warmup for warmup_iters steps
+    elif stats["step"] < CONFIG["warmup_iters"]:
+        lr = CONFIG["learning_rate"] * (stats["step"] + 1) / (CONFIG["warmup_iters"] + 1)
+
+    ## 2) constant learning rate for some time
+    elif stats["step"] / CONFIG["lr_decay_iters"] <= 1 - CONFIG["cooldown_frac"]:
+        lr = CONFIG["learning_rate"]
+
+    ## 3) if stats["step"] > lr_decay_iters, lr = min learning rate
+    elif stats["step"] > CONFIG["lr_decay_iters"]:
+        lr = CONFIG["min_lr"]
+
+    ## 4) in between, use cosine decay down to min learning rate
+    else:
+        const_lr_iters = int((1 - CONFIG["cooldown_frac"]) * CONFIG["lr_decay_iters"])
+        decay_ratio = (stats["step"] - const_lr_iters) / (CONFIG["lr_decay_iters"] - const_lr_iters)
+
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
+        lr = CONFIG["min_lr"] + coeff * (CONFIG["learning_rate"] - CONFIG["min_lr"])
+
+    ## set optimizers' learning rate
+    for o in optimizers:
+        for group in o.param_groups:
+            group["lr"] = lr
+    stats["lr"].append(lr)
 
 	# training section
-	loss = train_model()
+    for _ in range(CONFIG["gradient_accumulation_steps"]):
+        X, Y, _ = dataloader.next_batch("train")
+        _, loss = model(X, Y)
 
-	# logging
-	log_loss()
-	stats["steps"] += 1
+        # scale the loss to account for gradient accumulation
+        loss = loss / CONFIG["gradient_accumulation_steps"]
+
+        # backward pass
+        loss.backward()
+
+    if optimizer_hyperparams["use_muon"]:
+        for group in optimizers[1].param_groups:
+            frac = min(stats["step"] / 300, 1) # momentum warmup for muon
+            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+    ## step the optimizers
+    for o in optimizers:
+        o.step()
+
+    ## flush the gradients as soon as we can, no need for this memory anymore
+    optimizers[0].zero_grad(set_to_none=True)
+    model.zero_grad(set_to_none=True)
+
+	# validation section
+	## save checkpoint
+    if CONFIG["checkpoints"]["create_checkpoints"] and stats["step"] > 0 and stats["step"] % CONFIG["checkpoints"]["interval"] == 0:
+        print0(f"saved checkpoint at step {Fore.WHITE}{Style.BRIGHT}{stats["step"]}")
+        torch.save(get_state(model, optimizers), f"{CONFIG["checkpoints"]["path"]}/step{stats["step"]}.strawberry")
+
+	## log train-val loss
+    if stats["step"] > 0 or stats["step"] % CONFIG["eval_interval"] == 0:
+        losses = estimate_loss(model, dataloader.next_batch)
+        losses = []
+        eval_t1 = time.time()
+        eval_dt = eval_t1 - eval_t0
+        eval_t0 = eval_t1
+
+        print0(
+            f"{Fore.WHITE}{Style.BRIGHT}step",
+            f"{Fore.WHITE}{Style.DIM}[{stats["step"]}/{CONFIG["max_iters"]}]"
+            f"{Fore.RESET}{Style.RESET_ALL}:",
+            f"train loss {Fore.WHITE}{Style.BRIGHT}{losses["train"]:.4f}"
+            f"{Fore.RESET}{Style.RESET_ALL},",
+            f"val loss {Fore.WHITE}{Style.BRIGHT}{losses["val"]:.4f}"
+            f"{Fore.RESET}{Style.RESET_ALL},",
+            f"lr {Fore.WHITE}{Style.BRIGHT}{lr:.7f}"
+            f"{Fore.RESET}{Style.RESET_ALL},",
+            f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}"
+        )
+        stats["loss"]["train"].append(losses["train"])
+        stats["loss"]["val"].append(losses["val"])
+
+    ## log test loss
+    if stats["step"] % CONFIG["log_interval"] == 0:
+        test_t1 = time.time()
+        test_dt = test_t1 - test_t0
+        test_t0 = test_t1
+
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+        lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
+        toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"] * CONFIG["log_interval"]) / test_dt
+
+        print0(
+            f"{Fore.WHITE}{Style.BRIGHT}iter",
+            f"{Fore.WHITE}{Style.DIM}[{stats["step"]}/{CONFIG["max_iters"]}]"
+            f"{Fore.RESET}{Style.RESET_ALL}:",
+            f"loss {Fore.WHITE}{Style.BRIGHT}{lossf:.4f}"
+            f"{Fore.RESET}{Style.RESET_ALL},",
+            f"dt {Fore.WHITE}{Style.DIM}{calc_total_time(test_dt)}"
+            f"{Fore.RESET}{Style.RESET_ALL},",
+            f"tok/s {Fore.WHITE}{Style.DIM}{toks_per_sec:.2f}"
+        )
+        stats["loss"]["test"].append(lossf)
+    stats["step"] += 1
 
 print0("total time:", calc_total_time(time.time() - start_time))
-torch.save(get_trained_model(model, optimizers), CONFIG["save_path"])
+torch.save(get_state(model, optimizers), CONFIG["model_path"])

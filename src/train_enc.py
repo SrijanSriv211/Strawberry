@@ -1,5 +1,5 @@
 from encoder import Encoder
-import argparse
+import argparse, os
 enc = Encoder()
 
 # python src/train_enc.py -i data/base/data.txt -o bin/cl4k.bin -v 4096
@@ -14,8 +14,10 @@ parser.add_argument("-s", help="special tokens", type=list, default=[
     "<|eop|>", # end of prompt
     "<|eor|>", # end of reason
     "<|eot|>", # end of text
+    "<|sep|>",
     "<|call|>", # tool call
-    "<|sep|>"
+    "<|sink|>",
+    "<|mask|>"
 ])
 args = parser.parse_args()
 
@@ -28,7 +30,13 @@ CONFIG = {
 	"special_tokens": args.s
 }
 
+dir = os.path.split(CONFIG["outpath"])[0]
+if not os.path.isdir(dir):
+    os.mkdir(dir)
+
 #* set `vocab_size` in `config.json` 4096
 enc.train([CONFIG["dataset_path"], CONFIG["is_dir"]], CONFIG["vocab_size"], text_range=CONFIG["text_range"])
 enc.register_special_tokens(*CONFIG["special_tokens"])
 enc.save(CONFIG["outpath"])
+
+print("Special Tokens:\n", enc.special_tokens)

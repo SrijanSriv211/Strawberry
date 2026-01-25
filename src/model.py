@@ -53,28 +53,25 @@ class CompactCompute(nn.Module):
         self.n_embd = config.n_embd
 
         # original, adjust, transform
-        self.oa = CastedLinear(self.n_embd, 2*self.n_embd)
-        self.t = CastedLinear(self.n_embd, self.n_embd)
+        self.oat = CastedLinear(self.n_embd, 3*self.n_embd)
+        self.proj = CastedLinear(self.n_embd, self.n_embd)
 
-    def forward(self, x, cos_sin):
+        # zero out projection weights in all blocks
+        torch.nn.init.zeros_(self.proj.weight)
+
+    def forward(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        o, a = self.oa(norm(x)).view(B*T, 2*C).chunk(2, dim=-1) # (B*T, C)
-
-        # apply rotary embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        o, a = apply_rotary_emb(o, cos, sin), apply_rotary_emb(a, cos, sin) # OA rotary embedding
-        o, a = norm(o), norm(a) # OA norm
+        # calculate original, adjust, transform values
+        o, a, t = self.oat(norm(x)).view(B*T, 3*C).chunk(3, dim=-1) # (B*T, C)
 
         # perform a calculation similar to attention
         y = o.T @ a
         y = y / torch.sqrt(self.n_embd)
         y = torch.pi * F.tanh(y) # (C, C)
-        y = self.t(y)
-        y = y.view(1, self.n_embd, self.n_embd) # (B, T, C) -> (1, C, C)
-        return y, (B, T, C)
+        y = self.proj(y)
+        return y, t, (B, T, C)
 
 # new version of the old AttentionOnDetail
 class TheExpertAbundance(nn.Module):
@@ -114,9 +111,7 @@ class TheExpertAbundance(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
-        q = torch.softmax(q, dim=2)
-        k = torch.softmax(k, dim=2)
-        v = q * torch.cumsum(k * v, dim=2)
+        v = q * torch.cumsum(torch.sigmoid(k) * v, dim=2)
 
         # calculate sdpa
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
@@ -165,8 +160,8 @@ class Strawberry(nn.Module):
         x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
         x = norm(x)
 
-        for block in self.blocks:
-            for _ in range(self.config.r_layer):
+        for _ in range(self.config.r_layer):
+            for block in self.blocks:
                 x = block(x, cos_sin)
 
         x = norm(x)
