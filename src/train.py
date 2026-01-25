@@ -54,7 +54,6 @@ CONFIG = json.loads(open(sys.argv[1], "r", encoding="utf-8").read()) if len(sys.
 	"eval_interval": 2000,
 	"log_interval": 200,
 	"eval_iters": 200,
-	"sample_interval": 2000,
 
 	"decay_lr": True,
 	"lr_decay_iters": 50000,
@@ -179,6 +178,7 @@ class dataloader:
 
         x = torch.cat([sink_col, batch[:, :-1], mask_col], dim=1) # x: prepend SINK, drop last token, append MASK
         y = torch.cat([sink_col, batch], dim=1) # y: prepend SINK, keep full sequence
+        y[:, 1:-1] = -1 # mask every token other than first (sink) & last one with -1. this is important for training
 
         x, y = x.to(device), y.to(device)
         return x, y, batch
