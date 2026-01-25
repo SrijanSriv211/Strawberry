@@ -164,8 +164,8 @@ class dataloader:
 
         random.shuffle(self.train)
         random.shuffle(self.val)
-        self.train = torch.tensor(self.train, dtype=torch.int16)
-        self.val = torch.tensor(self.val, dtype=torch.int16)
+        self.train = torch.tensor(self.train, dtype=torch.int64)
+        self.val = torch.tensor(self.val, dtype=torch.int64)
         return n_train_toks, n_val_toks
 
     def next_batch(self, split):
@@ -244,7 +244,7 @@ model = torch.compile(model)
 # training loop
 # start training the model
 print0("started training")
-start_time, eval_t0, test_t0 = time.time()
+start_time = eval_t0 = test_t0 = time.time()
 n_steps = CONFIG["max_iters"] - stats["step"]
 
 for _ in range(n_steps):
@@ -282,7 +282,7 @@ for _ in range(n_steps):
 
 	# training section
     for _ in range(CONFIG["gradient_accumulation_steps"]):
-        X, Y, _ = dataloader.next_batch("train")
+        X, Y, _ = dataset.next_batch("train")
         _, loss = model(X, Y)
 
         # scale the loss to account for gradient accumulation
@@ -311,9 +311,8 @@ for _ in range(n_steps):
         torch.save(get_state(model, optimizers), f"{CONFIG["checkpoints"]["path"]}/step{stats["step"]}.strawberry")
 
 	## log train-val loss
-    if stats["step"] > 0 or stats["step"] % CONFIG["eval_interval"] == 0:
-        losses = estimate_loss(model, dataloader.next_batch)
-        losses = []
+    if stats["step"] > 0 and stats["step"] % CONFIG["eval_interval"] == 0:
+        losses = estimate_loss(model, dataset.next_batch)
         eval_t1 = time.time()
         eval_dt = eval_t1 - eval_t0
         eval_t0 = eval_t1
@@ -342,7 +341,7 @@ for _ in range(n_steps):
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
-        toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * CONFIG["block_size"] * CONFIG["log_interval"]) / test_dt
+        toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * hyperparams["block_size"] * CONFIG["log_interval"]) / test_dt
 
         print0(
             f"{Fore.WHITE}{Style.BRIGHT}iter",

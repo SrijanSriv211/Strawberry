@@ -7,15 +7,15 @@ def print0(*text, println=True, overwrite=False, save_to_file=True, log_path="bi
 	if println:
 		print(*text)
 
-	# if not save_to_file:
-	# 	return
+	if not save_to_file:
+		return
 
-	# # save cleaned text to the file
-	# if not os.path.isdir(log_path):
-	# 	os.mkdir(log_path)
+	# save cleaned text to the file
+	if not os.path.isdir(log_path):
+		os.mkdir(log_path)
 
-	# with open(os.path.join(log_path, "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
-	# 	f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
+	with open(os.path.join(log_path, "out.txt"), "w" if overwrite else "a", encoding="utf-8") as f:
+		f.write(" ".join(tuple(ansi_escape.sub('', part) for part in text)) + "\n")
 
 # cool DOS Rebel font ASCII banner made with https://manytools.org/hacker-tools/ascii-banner/
 def print_banner():

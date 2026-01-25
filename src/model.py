@@ -116,6 +116,9 @@ class TheExpertAbundance(nn.Module):
         # calculate sdpa
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
+        # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
         # output projection
         u, v = self.swiglu(y).chunk(2, dim=-1)
         return x + self.out(u * F.silu(v))
@@ -165,7 +168,7 @@ class Strawberry(nn.Module):
                 x = block(x, cos_sin)
 
         x = norm(x)
-        logits = F.linear(x, self.embed) # tying embed & unembed weights by using embed weights to unembed `x`
+        logits = F.linear(x, self.embed.weight) # tying embed & unembed weights by using embed weights to unembed `x`
 
         # forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
