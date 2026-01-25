@@ -2,12 +2,12 @@
 - Strawberry is a model architecture.
 - It is built on top of [Palm](https://github.com/SrijanSriv211/Palm)
 - It brings several improvements over the standard Transformer architecture, such as:
-    1. Share stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
-    2. Modern architecture: Rotary embeddings and QK-Norm
-    3. Share embedding weight
+    1. Shared stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
+    2. Modernized architecture: Rotary embeddings and QK-Norm
+    3. Shared embedding weights
     4. MoE based attention mechanism `The Expert Abundance`
     5. `Compaction Compute` layer makes the entire architecture independent of batch-size and context-length
-- `Strawberry s1` model based on this architecutre. **COMING SOON**
+- `Strawberry s1` language model based on this architecutre. **COMING SOON**
 
 ## The Expert Abundance
 
@@ -42,27 +42,23 @@ It looks quite similar to the standard attention mechanism formula.
 
 2. Pass an `RMS_norm(x)` into WO and WA to get O and A.
 
-3. Apply rotary embeddings and RMS norm on O & A.
+3. Our input `x` right now has a shape of `(B, T, C)` where `B = batch size`, `T = context length`, `C = embedding dimension`.
 
-4. Our input `x` right now has a shape of `(B, T, C)` where `B = batch size`, `T = context length`, `C = embedding dimension`.
+4. Similarly O & A also has a shape of `(B, T, C)`.
 
-5. Similarly O & A also has a shape of `(B, T, C)`.
+5. Reshape them both into a shape of `(B*T, C)`.
 
-6. Reshape them both into a shape of `(B*T, C)`.
+6. Therefore, O.T (where `.T` implies Transpose) will have a shape of `(C, B*T)`
 
-7. Therefore, O.T (where `.T` implies Transpose) will have a shape of `(C, B*T)`
+7. Now take a scaled dot product between `O.T` & `A` and normalize it with square root of `1/C`.
 
-8. Now take a scaled dot product between `O.T` & `A` and normalize it with square root of `1/C`.
+8. Then pass that into `pi*tanh` function and take a dot product of that with `WT`.
 
-9. Then pass that into `pi*tanh` function and take a dot product of that with `WT`.
+9. Proper formula is the following: `y = pi * tanh((O.T @ A) / sqrt(embd_dim)) @ T`.
 
-10. Proper formula is the following: `y = pi * tanh((O.T @ A) / sqrt(embd_dim)) @ T`.
+10. It will give us `y` with a shape of `(C, C)`
 
-11. It will give us `y` with a shape of `(C, C)`
-
-11. Reshape `y` into `(1, C, C)`
-
-12. We have now compacted our input of shape `(B, T, C)` to `(1, C, C)` and made a completely independent of batch-size and block-size.
+11. We have now compacted our input of shape `(B, T, C)` to `(C, C)` and made it completely independent of batch-size and block-size.
 
 ## Citation
 
