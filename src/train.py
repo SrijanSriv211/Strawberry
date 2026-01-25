@@ -332,6 +332,10 @@ for _ in range(n_steps):
         stats["loss"]["train"].append(losses["train"])
         stats["loss"]["val"].append(losses["val"])
 
+        ### sample generation
+        out = model.generate([], sink_tok, mask_tok, hyperparams["block_size"])[0].tolist()
+        print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```\n")
+
     ## log test loss
     if stats["step"] % CONFIG["log_interval"] == 0:
         test_t1 = time.time()
