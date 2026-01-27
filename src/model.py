@@ -45,34 +45,6 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.weight)
 
-# perform a compaction computation on input to make it batch-size & block-size independent
-#! WARNING: THIS TING IS UNTESTED
-class CompactCompute(nn.Module):
-    def __init__(self, config: Config):
-        super().__init__()
-        self.n_embd = config.n_embd
-
-        # original, adjust, transform
-        self.oat = CastedLinear(self.n_embd, 3*self.n_embd)
-        self.proj = CastedLinear(self.n_embd, self.n_embd)
-
-        # zero out projection weights in all blocks
-        torch.nn.init.zeros_(self.proj.weight)
-
-    def forward(self, x):
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
-
-        # calculate original, adjust, transform values
-        o, a, t = self.oat(norm(x)).view(B*T, 3*C).chunk(3, dim=-1) # (B*T, C)
-
-        # perform a calculation similar to attention
-        y = o.T @ a
-        y = y / torch.sqrt(self.n_embd)
-        y = torch.pi * F.tanh(y) # (C, C)
-        y = self.proj(y)
-        return y, t, (B, T, C)
-
 # new version of the old AttentionOnDetail
 class TheExpertAbundance(nn.Module):
     def __init__(self, config: Config):
@@ -92,9 +64,6 @@ class TheExpertAbundance(nn.Module):
         self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
         self.out = CastedLinear(config.n_embd, config.n_embd)
 
-        # zero out projection weights in all blocks
-        torch.nn.init.zeros_(self.out.weight)
-
     def forward(self, x, cos_sin):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, _ = x.size()
@@ -111,10 +80,10 @@ class TheExpertAbundance(nn.Module):
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
-        v = q * torch.cumsum(torch.sigmoid(k) * v, dim=2)
+        v = torch.sigmoid(q) * torch.cumsum(torch.softmax(k, dim=2) * v, dim=2)
 
         # calculate sdpa
-        y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
@@ -133,6 +102,8 @@ class Strawberry(nn.Module):
         # factorized token embeddings
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
         self.blocks = nn.ModuleList([TheExpertAbundance(config) for _ in range(config.n_layer)])
+        self.unembed = CastedLinear(config.n_embd, config.vocab_size)
+        self.embed.weight = self.unembed.weight
 
         # to support meta device initialization, we init the rotary embeddings here, but it's fake
         # as for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
@@ -160,35 +131,32 @@ class Strawberry(nn.Module):
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         cos_sin = self.cos[:, :+T], self.sin[:, :+T]
 
-        x = self.embed(idx) # token embeddings of shape (b, t, n_embd)
+        # token embeddings of shape (b, t, n_embd)
+        x = self.embed(idx)
         x = norm(x)
 
         for _ in range(self.config.r_layer):
             for block in self.blocks:
                 x = block(x, cos_sin)
 
-        x = norm(x)
-        logits = F.linear(x, self.embed.weight) # tying embed & unembed weights by using embed weights to unembed `x`
-
         # forward the lm_head (compute logits)
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
+        x = norm(x)
+        logits = self.unembed(x)
 
         # if we are given some desired targets also calculate the loss
         loss = None if targets is None else F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction="mean")
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, sink_tok, mask_tok, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, sink_tok, max_new_tokens, temperature=1.0, top_k=None):
         sink_tok = torch.tensor([sink_tok], dtype=torch.int64).unsqueeze(0)
-        mask_tok = torch.tensor([mask_tok], dtype=torch.int64).unsqueeze(0)
         idx = torch.tensor(idx, dtype=torch.int64).unsqueeze(0)
 
         for _ in range(max_new_tokens):
             # our very first step, pass the initial sequence context to the model
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx[:, -self.config.block_size:] if idx.size(1) > self.config.block_size else idx
-            idx_cond = torch.cat([sink_tok, idx_cond, mask_tok], dim=1)
+            idx_cond = torch.cat([sink_tok, idx_cond], dim=1)
 
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)

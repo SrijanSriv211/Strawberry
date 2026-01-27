@@ -71,14 +71,16 @@ if CONFIG["seed"] != "auto":
 if CONFIG["checkpoints"]["create_checkpoints"] and not os.path.isdir(CONFIG["checkpoints"]["path"]):
     os.mkdir(CONFIG["checkpoints"]["path"])
 
+log_path = CONFIG["checkpoints"]["path"] if CONFIG["checkpoints"]["create_checkpoints"] else "bin"
+
 # set device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 init_from = CONFIG["init_from"][11:] if CONFIG["init_from"].startswith("pretrained,") else "scratch"
 
 # print the device
 print_banner()
-print0(f"config: {Fore.WHITE}{Style.DIM}`{json.dumps(CONFIG)}`", overwrite=(init_from == "scratch"))
-print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}")
+print0(f"config: {Fore.WHITE}{Style.DIM}`{json.dumps(CONFIG)}`", overwrite=(init_from == "scratch"), log_path=log_path)
+print0("Training on", f"{Fore.YELLOW}{Style.BRIGHT}{device}", log_path=log_path)
 
 # load stats
 checkpoint = None if init_from == "scratch" else torch.load(init_from)
@@ -137,12 +139,13 @@ if checkpoint is not None:
         o.load_state_dict(s)
 
 class dataloader:
-    def __init__(self, path, block_size, batch_size, sink_tok, mask_tok, data_division=0.8, isfile=True):
+    def __init__(self, path, block_size, batch_size, sink_tok, data_division=0.8, isfile=True):
         self.path = path
         self.data_division = data_division
-        self.sink_tok, self.mask_tok = sink_tok, mask_tok
         self.block_size, self.batch_size = block_size, batch_size
         self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
+
+        self.sink_col = torch.full((self.batch_size, 1), sink_tok)
 
     def load_dataset(self):
         self.train, self.val = [], []
@@ -169,19 +172,10 @@ class dataloader:
 
     def next_batch(self, split):
         data = self.train if split == "train" else self.val
-
         ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-        batch = torch.stack([data[i:i + self.block_size] for i in ix])
-
-        sink_col = torch.full((self.batch_size, 1), self.sink_tok, dtype=batch.dtype, device=batch.device)
-        mask_col = torch.full((self.batch_size, 1), self.mask_tok, dtype=batch.dtype, device=batch.device)
-
-        x = torch.cat([sink_col, batch[:, :-1], mask_col], dim=1) # x: prepend SINK, drop last token, append MASK
-        y = torch.cat([sink_col, batch], dim=1) # y: prepend SINK, keep full sequence
-        y[:, 1:-1] = -1 # mask every token other than first (sink) & last one with -1. this is important for training
-
-        x, y = x.to(device), y.to(device)
-        return x, y, batch
+        y = torch.stack([data[i:i + self.block_size] for i in ix])
+        x = torch.cat([self.sink_col, y[:, :-1]], dim=1) # x: prepend SINK, drop last token
+        return x.to(device), y.to(device)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -191,7 +185,7 @@ def estimate_loss(model, next_batch):
 	for split in ["train", "val"]:
 		losses = torch.zeros(CONFIG["eval_iters"])
 		for k in track(range(CONFIG["eval_iters"]), description=f"{Fore.WHITE}{Style.BRIGHT}calc {Fore.WHITE}{Style.DIM}{split} loss{Style.RESET_ALL}"):
-			X, Y, _ = next_batch(split)
+			X, Y = next_batch(split)
 			_, loss = model(X, Y)
 			losses[k] = loss.item()
 		out[split] = losses.mean()
@@ -218,32 +212,37 @@ def get_state(model: Strawberry, optimizers: list[torch.optim.AdamW, Muon]):
 # load encoder
 enc = Encoder()
 enc.load(CONFIG["encoder_path"])
-sink_tok, mask_tok = enc.special_tokens["<|sink|>"], enc.special_tokens["<|mask|>"]
+sink_tok = enc.special_tokens["<|sink|>"]
 
 # load dataset
 dataset = dataloader(
     CONFIG["dataset"]["path"],
-    hyperparams["block_size"], CONFIG["batch_size"], sink_tok, mask_tok,
+    hyperparams["block_size"], CONFIG["batch_size"], sink_tok,
     CONFIG["dataset"]["data_division"], CONFIG["dataset"]["load_from_file"]
 )
 n_train_toks, n_val_toks = dataset.load_dataset()
 
-print0(f"{Fore.WHITE}{Style.BRIGHT}{((n_train_toks + n_val_toks)/1e6)}M", "total tokens")
+print0(f"{Fore.WHITE}{Style.BRIGHT}{((n_train_toks + n_val_toks)/1e6)}M", "total tokens", log_path=log_path)
 print0(
 	f"{Fore.WHITE}{Style.BRIGHT}{(n_train_toks/1e6)}M", "train tokens,",
-    f"{Fore.WHITE}{Style.BRIGHT}{(n_val_toks/1e6)}M", "val tokens"
+    f"{Fore.WHITE}{Style.BRIGHT}{(n_val_toks/1e6)}M", "val tokens",
+    log_path=log_path
 )
 
 # report number of parameters
-print0(f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters")
+print0(
+    f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters,",
+    f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.blocks.parameters())/1e6}M", "non-embedding parameters",
+    log_path=log_path
+)
 
 # compile the model
-print0(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)")
+print0(f"compiling the model... {Fore.WHITE}{Style.DIM}(takes a ~minute)", log_path=log_path)
 model = torch.compile(model)
 
 # training loop
 # start training the model
-print0("started training")
+print0("started training", log_path=log_path)
 start_time = eval_t0 = test_t0 = time.time()
 n_steps = CONFIG["max_iters"] - stats["step"]
 
@@ -282,7 +281,7 @@ for _ in range(n_steps):
 
 	# training section
     for _ in range(CONFIG["gradient_accumulation_steps"]):
-        X, Y, _ = dataset.next_batch("train")
+        X, Y = dataset.next_batch("train")
         _, loss = model(X, Y)
 
         # scale the loss to account for gradient accumulation
@@ -307,7 +306,7 @@ for _ in range(n_steps):
 	# validation section
 	## save checkpoint
     if CONFIG["checkpoints"]["create_checkpoints"] and stats["step"] > 0 and stats["step"] % CONFIG["checkpoints"]["interval"] == 0:
-        print0(f"saved checkpoint at step {Fore.WHITE}{Style.BRIGHT}{stats["step"]}")
+        print0(f"saved checkpoint at step {Fore.WHITE}{Style.BRIGHT}{stats["step"]}", log_path=log_path)
         torch.save(get_state(model, optimizers), f"{CONFIG["checkpoints"]["path"]}/step{stats["step"]}.strawberry")
 
 	## log train-val loss
@@ -327,14 +326,15 @@ for _ in range(n_steps):
             f"{Fore.RESET}{Style.RESET_ALL},",
             f"lr {Fore.WHITE}{Style.BRIGHT}{lr:.7f}"
             f"{Fore.RESET}{Style.RESET_ALL},",
-            f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}"
+            f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}",
+            log_path=log_path
         )
         stats["loss"]["train"].append(losses["train"])
         stats["loss"]["val"].append(losses["val"])
 
         ### sample generation
-        out = model.generate([], sink_tok, mask_tok, hyperparams["block_size"])[0].tolist()
-        print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```\n")
+        out = model.generate([], sink_tok, hyperparams["block_size"])[0].tolist()
+        print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```\n", log_path=log_path)
 
     ## log test loss
     if stats["step"] % CONFIG["log_interval"] == 0:
@@ -355,7 +355,8 @@ for _ in range(n_steps):
             f"{Fore.RESET}{Style.RESET_ALL},",
             f"dt {Fore.WHITE}{Style.DIM}{calc_total_time(test_dt)}"
             f"{Fore.RESET}{Style.RESET_ALL},",
-            f"tok/s {Fore.WHITE}{Style.DIM}{toks_per_sec:.2f}"
+            f"tok/s {Fore.WHITE}{Style.DIM}{toks_per_sec:.2f}",
+            log_path=log_path
         )
         stats["loss"]["test"].append(lossf)
     stats["step"] += 1
