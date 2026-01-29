@@ -154,6 +154,7 @@ class dataloader:
             with open(file, "rb") as f:
                 dataset = pickle.load(f)["dataset"]
 
+            random.shuffle(dataset)
             flat_dataset = chain.from_iterable(dataset)
             del dataset
 
@@ -164,8 +165,6 @@ class dataloader:
             self.train.extend(flat_dataset[:n_train_toks])
             self.val.extend(flat_dataset[n_train_toks:])
 
-        random.shuffle(self.train)
-        random.shuffle(self.val)
         self.train = torch.tensor(self.train, dtype=torch.int64)
         self.val = torch.tensor(self.val, dtype=torch.int64)
         return n_train_toks, n_val_toks
@@ -245,6 +244,7 @@ model = torch.compile(model)
 print0("started training", log_path=log_path)
 start_time = eval_t0 = test_t0 = time.time()
 n_steps = CONFIG["max_iters"] - stats["step"]
+steps_per_epoch = int((n_train_toks + n_val_toks) / (hyperparams["block_size"] * CONFIG["batch_size"]))
 
 for _ in range(n_steps):
 	# determine and set the learning rate for this iteration
@@ -278,6 +278,11 @@ for _ in range(n_steps):
         for group in o.param_groups:
             group["lr"] = lr
     stats["lr"].append(lr)
+
+    # reloading & shuffling dataset
+    if stats["step"] > 0 and stats["step"] % steps_per_epoch == 0:
+        print0(f"reshuffled dataset at step {Fore.WHITE}{Style.BRIGHT}{stats["step"]}", log_path=log_path)
+        dataset.load_dataset()
 
 	# training section
     for _ in range(CONFIG["gradient_accumulation_steps"]):

@@ -31,12 +31,11 @@ def generate(i, e, l=256, t=0.8, f=None, T=None):
     # load the encoder
     enc = Encoder()
     enc.load(e)
-    sink_tok, mask_tok = enc.special_tokens["<|sink|>"], enc.special_tokens["<|mask|>"]
 
     # encode text and generate output
     enctxt = enc.encode(T, allowed_special="all") if T is not None else []
     out = model.generate(
-        enctxt, sink_tok, mask_tok,
+        enctxt, enc.special_tokens["<|sink|>"],
         max_new_tokens=l, temperature=t, top_k=f
     )[0].tolist()
     return enc.decode(out)
