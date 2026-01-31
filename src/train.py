@@ -32,7 +32,8 @@ CONFIG = json.loads(open(sys.argv[1], "r", encoding="utf-8").read()) if len(sys.
         "n_layer": 2,
         "n_head": 4,
         "n_embd": 64,
-        "n_qkv": 256
+        "n_qkv": 256,
+        "n_ffn": 256
     },
     "optimizer_hyperparams": {
         "eps": 1e-10,
@@ -279,11 +280,6 @@ for _ in range(n_steps):
             group["lr"] = lr
     stats["lr"].append(lr)
 
-    # reloading & shuffling dataset
-    if stats["step"] > 0 and stats["step"] % steps_per_epoch == 0:
-        print0(f"reshuffled dataset at step {Fore.WHITE}{Style.BRIGHT}{stats["step"]}", log_path=log_path)
-        dataset.load_dataset()
-
 	# training section
     for _ in range(CONFIG["gradient_accumulation_steps"]):
         X, Y = dataset.next_batch("train")
@@ -339,7 +335,7 @@ for _ in range(n_steps):
 
         ### sample generation
         out = model.generate([], sink_tok, hyperparams["block_size"])[0].tolist()
-        print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```\n", log_path=log_path)
+        print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)
 
     ## log test loss
     if stats["step"] % CONFIG["log_interval"] == 0:
@@ -366,5 +362,5 @@ for _ in range(n_steps):
         stats["loss"]["test"].append(lossf)
     stats["step"] += 1
 
-print0("total time:", calc_total_time(time.time() - start_time))
+print0("total time:", calc_total_time(time.time() - start_time), log_path=log_path)
 torch.save(get_state(model, optimizers), CONFIG["model_path"])

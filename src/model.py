@@ -11,6 +11,7 @@ class Config:
     n_head: int = 4
     n_embd: int = 64
     n_qkv: int = 256
+    n_ffn: int = 256
     n_experts: int = 4 # total experts
     a_experts: int = 2 # active experts
 
@@ -52,11 +53,6 @@ class TheExpertAbundance(nn.Module):
         self.d_head = config.n_qkv // config.n_head
         self.n_head = config.n_head
 
-        # experts
-        self.a_experts = config.a_experts
-        self.n_experts = config.n_experts
-        # self.gate = CastedLinear(config.n_embd, self.n_experts)
-
         # merged QKV weights
         self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
 
@@ -79,9 +75,6 @@ class TheExpertAbundance(nn.Module):
         # make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
-        # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
-        v = torch.sigmoid(q) * torch.cumsum(torch.softmax(k, dim=2) * v, dim=2)
-
         # calculate sdpa
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
@@ -92,6 +85,30 @@ class TheExpertAbundance(nn.Module):
         u, v = self.swiglu(y).chunk(2, dim=-1)
         return x + self.out(u * F.silu(v))
 
+class Swiglu(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.swiglu = CastedLinear(config.n_embd, config.n_ffn*2)
+        self.out = CastedLinear(config.n_ffn, config.n_embd)
+
+    def forward(self, x):
+        u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
+        return x + self.out(u * F.silu(v))
+
+class Block(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.r_layer = config.r_layer
+
+        self.tea = nn.ModuleList([TheExpertAbundance(config) for _ in range(config.r_layer)])
+        self.swiglu = Swiglu(config)
+
+    def forward(self, x, cos_sin):
+        for tea in self.tea:
+            x = tea(x, cos_sin)
+
+        return self.swiglu(x)
+
 class Strawberry(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -101,7 +118,7 @@ class Strawberry(nn.Module):
 
         # factorized token embeddings
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        self.blocks = nn.ModuleList([TheExpertAbundance(config) for _ in range(config.n_layer)])
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.unembed = CastedLinear(config.n_embd, config.vocab_size)
         self.embed.weight = self.unembed.weight
 
@@ -135,9 +152,8 @@ class Strawberry(nn.Module):
         x = self.embed(idx)
         x = norm(x)
 
-        for _ in range(self.config.r_layer):
-            for block in self.blocks:
-                x = block(x, cos_sin)
+        for block in self.blocks:
+            x = block(x, cos_sin)
 
         # forward the lm_head (compute logits)
         x = norm(x)
@@ -155,7 +171,7 @@ class Strawberry(nn.Module):
         for _ in range(max_new_tokens):
             # our very first step, pass the initial sequence context to the model
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx[:, -self.config.block_size:] if idx.size(1) > self.config.block_size else idx
+            idx_cond = idx[:, -self.rotary_block_size:] if idx.size(1) > self.rotary_block_size else idx
             idx_cond = torch.cat([sink_tok, idx_cond], dim=1)
 
             # forward the model to get the logits for the index in the sequence
