@@ -46,7 +46,43 @@ class CastedLinear(nn.Module):
     def forward(self, x):
         return F.linear(x, self.weight)
 
-# new version of the old AttentionOnDetail
+# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
+class AttentionFreeTransformer(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        # merged QKV weights
+        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
+
+        # out projection weights
+        self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
+        self.out = CastedLinear(config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.qkv(norm(x)).chunk(3, dim=-1) # (B, T, C)
+
+        # exponentiate keys
+        w = torch.exp(k)
+        kv = w * v
+
+        # causal cumulative sums
+        w = torch.cumsum(w, dim=1)
+        kv = torch.cumsum(kv, dim=1)
+
+        # normalize
+        y = kv / (w + 1e-6)
+
+        # gate with query
+        y = F.sigmoid(q) * y
+
+        # output projection
+        u, v = self.swiglu(y).chunk(2, dim=-1)
+        return x + self.out(u * F.silu(v))
+
+# new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -85,6 +121,22 @@ class TheExpertAbundance(nn.Module):
         u, v = self.swiglu(y).chunk(2, dim=-1)
         return x + self.out(u * F.silu(v))
 
+class Retention(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        # merged OAT (Original & Adjust) weights
+        self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
+        self.t = CastedLinear(config.n_embd, config.n_embd) # transform weights
+
+    def forward(self, x):
+        # batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
+
+        o, a = self.oat(norm(x)).view(B*T, C).chunk(2, dim=-1)
+
+        y = (o.T @ F.silu(a))
+        return self.t(y)
+
 class Swiglu(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -98,15 +150,15 @@ class Swiglu(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.r_layer = config.r_layer
-
-        self.tea = nn.ModuleList([TheExpertAbundance(config) for _ in range(config.r_layer)])
+        self.aft = nn.ModuleList([AttentionFreeTransformer(config) for _ in range(config.r_layer)])
+        # self.tea = TheExpertAbundance(config)
         self.swiglu = Swiglu(config)
 
     def forward(self, x, cos_sin):
-        for tea in self.tea:
-            x = tea(x, cos_sin)
+        for aft in self.aft:
+            x = aft(x)
 
+        # x = self.tea(x, cos_sin)
         return self.swiglu(x)
 
 class Strawberry(nn.Module):
