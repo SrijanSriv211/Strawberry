@@ -49,6 +49,9 @@ class CastedLinear(nn.Module):
 class RetentionMechanism(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
+        self.n_embd = config.n_embd
+        self.n_qkv = config.n_qkv
+
         # merged OAT weights
         self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
         self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
@@ -65,39 +68,32 @@ class RetentionMechanism(nn.Module):
         scale_factor = 1 / math.sqrt(C)
         y = o.T @ a
         y = F.tanh(y) * scale_factor
-        return self.t(y).T # transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
+
+        # transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
+        y = self.t(y).T
+
+        # w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+        w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+        w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
+
+        return (w_qkv, w_swiglu, w_out)
 
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
-        self.n_embd = config.n_embd
-        self.n_qkv = config.n_qkv
+        # merged QKV weights
+        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
 
-        # merged QKV, swiglu & out weights
-        self.qkvso = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
+        # out projection weights
+        self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
+        self.out = CastedLinear(config.n_embd, config.n_embd)
 
-    # w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-    # c -> current; p -> previous; n -> new; t -> transform
-    def retain(self, ct, pt=None):
-        if pt is None:
-            pt = self.qkvso.weight
+    def forward(self, x, w):
+        w_qkv, w_swiglu, w_out = w
 
-        nt = ct * F.silu(pt) + pt
-        nt, ct = norm(nt), norm(ct)
-
-        w_qkv, w_swiglu, w_out = torch.split(nt, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
-        w_swiglu = w_swiglu.reshape(self.n_qkv, 2*self.n_embd)
-
-        self.qkv = lambda x: F.linear(x, w_qkv)
-        self.swiglu = lambda x: x @ w_swiglu
-        self.out = lambda x: F.linear(x, w_out)
-
-        return nt, ct
-
-    def forward(self, x):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(norm(x)).chunk(3, dim=-1) # (B, T, C)
+        q, k, v = F.linear(norm(x), w_qkv).chunk(3, dim=-1) # (B, T, C)
         q, k = norm(q), norm(k) # QK norm
 
         # exponentiate keys
@@ -115,8 +111,8 @@ class AttentionFreeTransformer(nn.Module):
         y = F.sigmoid(q) * y
 
         # output projection
-        u, v = self.swiglu(y).chunk(2, dim=-1)
-        return x + self.out(u * F.silu(v))
+        u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
+        return x + F.linear(u * F.silu(v), w_out)
 
 # new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
@@ -179,12 +175,17 @@ class Block(nn.Module):
         self.swiglu = Swiglu(config)
 
     def forward(self, x, cos_sin):
-        ct, pt = self.retention(x), None
+        w_curr, w_old = self.retention(x), (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight)
 
         # for aft in self.aft:
         for _ in range(self.r_layer):
-            ct, pt = self.aft.retain(ct, pt)
-            x = self.aft(x)
+            w_new = (
+                w_curr[0] * w_old[0] + w_old[0],
+                w_curr[1] * w_old[1] + w_old[1],
+                w_curr[2] * w_old[2] + w_old[2]
+            )
+            w_old = w_curr
+            x = self.aft(x, w_new)
 
         # x = self.tea(x, cos_sin)
         return self.swiglu(x)
