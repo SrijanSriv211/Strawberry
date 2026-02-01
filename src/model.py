@@ -170,22 +170,20 @@ class Block(nn.Module):
 
         self.retention = RetentionMechanism(config)
         self.aft = AttentionFreeTransformer(config)
-        # self.aft = nn.ModuleList([AttentionFreeTransformer(config) for _ in range(config.r_layer)])
         # self.tea = TheExpertAbundance(config)
         self.swiglu = Swiglu(config)
 
     def forward(self, x, cos_sin):
-        w_curr, w_old = self.retention(x), (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight)
+        # wc -> current weights; wt -> transform weights
+        wc, wt = (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight), self.retention(x)
 
-        # for aft in self.aft:
         for _ in range(self.r_layer):
-            w_new = (
-                w_curr[0] * w_old[0] + w_old[0],
-                w_curr[1] * w_old[1] + w_old[1],
-                w_curr[2] * w_old[2] + w_old[2]
+            x = self.aft(x, wc)
+            wt, wc = wc, (
+                wt[0] * wc[0] + wc[0],
+                wt[1] * wc[1] + wc[1],
+                wt[2] * wc[2] + wc[2]
             )
-            w_old = w_curr
-            x = self.aft(x, w_new)
 
         # x = self.tea(x, cos_sin)
         return self.swiglu(x)
