@@ -56,7 +56,15 @@ class RetentionMechanism(nn.Module):
         self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
         self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
 
-    def forward(self, x):
+    # return the new "old" & "current" weights.
+    def forward(self, wt, wc):
+        return wc, (
+            wt[0] * F.silu(wc[0]) + wc[0],
+            wt[1] * F.silu(wc[1]) + wc[1],
+            wt[2] * F.silu(wc[2]) + wc[2]
+        )
+
+    def produce(self, x):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, C = x.size()
 
@@ -70,7 +78,7 @@ class RetentionMechanism(nn.Module):
         y = F.tanh(y) * scale_factor
 
         # transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-        y = self.t(y).T
+        y = norm(self.t(y).T)
 
         # w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
         w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
@@ -168,22 +176,18 @@ class Block(nn.Module):
         super().__init__()
         self.r_layer = config.r_layer
 
-        self.retention = RetentionMechanism(config)
+        self.retain = RetentionMechanism(config)
         self.aft = AttentionFreeTransformer(config)
         # self.tea = TheExpertAbundance(config)
         self.swiglu = Swiglu(config)
 
     def forward(self, x, cos_sin):
         # wc -> current weights; wt -> transform weights
-        wc, wt = (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight), self.retention(x)
+        wc, wt = (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight), self.retain.produce(x)
 
         for _ in range(self.r_layer):
             x = self.aft(x, wc)
-            wt, wc = wc, (
-                wt[0] * wc[0] + wc[0],
-                wt[1] * wc[1] + wc[1],
-                wt[2] * wc[2] + wc[2]
-            )
+            wt, wc = self.retain(wt, wc)
 
         # x = self.tea(x, cos_sin)
         return self.swiglu(x)
