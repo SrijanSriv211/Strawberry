@@ -59,9 +59,9 @@ class RetentionMechanism(nn.Module):
     # return the new "old" & "current" weights.
     def forward(self, wt, wc):
         return wc, (
-            wt[0] * F.silu(wc[0]) + wc[0],
-            wt[1] * F.silu(wc[1]) + wc[1],
-            wt[2] * F.silu(wc[2]) + wc[2]
+            norm(wt[0]) * F.silu(wc[0]) + norm(wc[0]),
+            norm(wt[1]) * F.silu(wc[1]) + norm(wc[1]),
+            norm(wt[2]) * F.silu(wc[2]) + norm(wc[2])
         )
 
     def produce(self, x):
@@ -69,16 +69,16 @@ class RetentionMechanism(nn.Module):
         B, T, C = x.size()
 
         # calculate orignal & adjust values
-        o, a = self.oa(norm(x)).view(B*T, -1).chunk(2, dim=-1) # (B, T, C)
+        o, a = self.oa(norm(x)).view(B*T, -1).chunk(2, dim=-1) # (B*T, C)
         o, a = norm(o), norm(a)
 
-        # compact O & A into (C, C) shape
+        # compact O & A of shape (B*T, C) -> (C, C) shape
         scale_factor = 1 / math.sqrt(C)
-        y = o.T @ a
-        y = F.tanh(y) * scale_factor
+        y = o.T @ a * scale_factor
+        y = F.softmax(y, dim=-1)
 
         # transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-        y = norm(self.t(y).T)
+        y = self.t(y).T
 
         # w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
         w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
