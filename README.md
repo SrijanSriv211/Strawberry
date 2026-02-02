@@ -24,10 +24,10 @@ Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
 - `(C, 5*D+C)` can be splitted into 3 weights; **w_qkv shape**: `(C, 3*D)`, **w_swiglu shape**: `(D, 2*C)` & **w_out shape**: `(C, C)`
 
 2. Initialization
-- We have **attn_w_qkv**, **attn_w_swiglu** & **attn_w_out**. QKV, Swiglu & out proj parameters of the attention mechanism.
+- We have **w_attn_qkv**, **w_attn_swiglu** & **w_attn_out**. QKV, Swiglu & out proj parameters of the attention mechanism.
 - We also have **w_qkv**, **w_swiglu** & **w_out**. QKV, Swiglu & out proj parameters derived from the retention mechanism.
 - We create 2 variables Current (`wC`) & Transformed (`wT`).
-- Then we set them as the following `wC = tuple(attn_w_qkv, attn_w_swiglu, attn_w_out)` & `wT = tuple(w_qkv, w_swiglu, w_out)`.
+- Then we set them as the following `wC = tuple(w_attn_qkv, w_attn_swiglu, w_attn_out)` & `wT = tuple(w_qkv, w_swiglu, w_out)`.
 
 3. Update rule
 - First we always perform attention on `wC`.

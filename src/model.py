@@ -56,12 +56,19 @@ class RetentionMechanism(nn.Module):
         self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
         self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
 
+        # merged QKV weights
+        self.w_attn_qkv = CastedLinear(config.n_embd, 3*config.n_qkv).weight
+
+        # out projection weights
+        self.w_attn_swiglu = CastedLinear(config.n_qkv, 2*config.n_embd).weight
+        self.w_attn_out = CastedLinear(config.n_embd, config.n_embd).weight
+
     # return the new "old" & "current" weights.
     def forward(self, wt, wc):
         return wc, (
-            norm(wt[0]) * F.silu(wc[0]) + norm(wc[0]),
-            norm(wt[1]) * F.silu(wc[1]) + norm(wc[1]),
-            norm(wt[2]) * F.silu(wc[2]) + norm(wc[2])
+            norm(wt[0]) * F.silu(wc[0]) + wc[0],
+            norm(wt[1]) * F.silu(wc[1]) + wc[1],
+            norm(wt[2]) * F.silu(wc[2]) + wc[2]
         )
 
     def produce(self, x):
@@ -84,18 +91,12 @@ class RetentionMechanism(nn.Module):
         w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
         w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
 
-        return (w_qkv, w_swiglu, w_out)
+        return (self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out), (w_qkv, w_swiglu, w_out)
 
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
-    def __init__(self, config: Config):
+    def __init__(self):
         super().__init__()
-        # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
-
-        # out projection weights
-        self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
-        self.out = CastedLinear(config.n_embd, config.n_embd)
 
     def forward(self, x, w):
         w_qkv, w_swiglu, w_out = w
@@ -129,19 +130,15 @@ class TheExpertAbundance(nn.Module):
         self.d_head = config.n_qkv // config.n_head
         self.n_head = config.n_head
 
-        # merged QKV weights
-        self.qkv = CastedLinear(config.n_embd, 3*config.n_qkv)
-
-        # out projection weights
-        self.swiglu = CastedLinear(config.n_qkv, 2*config.n_embd)
-        self.out = CastedLinear(config.n_embd, config.n_embd)
-
-    def forward(self, x, cos_sin):
+    def forward(self, x, cos_sin, w):
         # batch size, sequence length, embedding dimensionality (n_embd)
         B, T, _ = x.size()
 
+        # retention mechanism produced qkv, swiglu & out proj weights
+        w_qkv, w_swiglu, w_out = w
+
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.qkv(norm(x)).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
+        q, k, v = F.linear(norm(x), w_qkv).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
 
         # apply rotary embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -158,8 +155,8 @@ class TheExpertAbundance(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
         # output projection
-        u, v = self.swiglu(y).chunk(2, dim=-1)
-        return x + self.out(u * F.silu(v))
+        u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
+        return x + F.linear(u * F.silu(v), w_out)
 
 class Swiglu(nn.Module):
     def __init__(self, config: Config):
@@ -177,19 +174,19 @@ class Block(nn.Module):
         self.r_layer = config.r_layer
 
         self.retain = RetentionMechanism(config)
-        self.aft = AttentionFreeTransformer(config)
-        # self.tea = TheExpertAbundance(config)
+        self.aft = AttentionFreeTransformer()
+        self.tea = TheExpertAbundance(config)
         self.swiglu = Swiglu(config)
 
     def forward(self, x, cos_sin):
         # wc -> current weights; wt -> transform weights
-        wc, wt = (self.aft.qkv.weight, self.aft.swiglu.weight, self.aft.out.weight), self.retain.produce(x)
+        wc, wt = self.retain.produce(x)
 
         for _ in range(self.r_layer):
             x = self.aft(x, wc)
             wt, wc = self.retain(wt, wc)
 
-        # x = self.tea(x, cos_sin)
+        x = self.tea(x, cos_sin, wc)
         return self.swiglu(x)
 
 class Strawberry(nn.Module):
