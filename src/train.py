@@ -176,7 +176,8 @@ class dataloader:
 	def next_batch(self, split):
 		if split == "train":
 			data = self.train
-			range = self.ptr = random.randint(0, self.block_size) if self.ptr + self.block_size > len(data) else (self.ptr + self.block_size)
+			ptr = self.ptr + self.block_size * self.batch_size
+			range = self.ptr = random.randint(0, self.block_size) if ptr > len(data) else ptr
 
 		else:
 			data = self.val
