@@ -8,8 +8,6 @@ class Config:
 	block_size: int = 1024
 	n_layer: int = 2 # new layers
 	r_layer: int = 2 # reuse layers
-	r_alpha: int = 0.3
-	r_beta: int = 0.7
 	n_head: int = 4
 	n_embd: int = 64
 	n_qkv: int = 256
@@ -53,8 +51,6 @@ class RetentionMechanism(nn.Module):
 		super().__init__()
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
-		self.alpha = config.r_alpha
-		self.beta = config.r_beta
 
 		# merged OAT weights
 		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
@@ -70,9 +66,9 @@ class RetentionMechanism(nn.Module):
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
 		return wc, (
-			self.alpha * norm(wt[0]) * F.sigmoid(wc[0]) + self.beta * norm(wc[0]),
-			self.alpha * norm(wt[1]) * F.sigmoid(wc[1]) + self.beta * norm(wc[1]),
-			self.alpha * norm(wt[2]) * F.sigmoid(wc[2]) + self.beta * norm(wc[2])
+			norm(wt[0] * F.silu(wc[0])) + norm(wc[0]),
+			norm(wt[1] * F.silu(wc[1])) + norm(wc[1]),
+			norm(wt[2] * F.silu(wc[2])) + norm(wc[2])
 		)
 
 	def produce(self, x):
