@@ -11,13 +11,13 @@ parser.add_argument("-v", help="vocab size", type=int, required=True)
 parser.add_argument("-d", help="is directory", type=bool, default=False)
 parser.add_argument("-r", help="text range", type=int, default=100_000_000)
 parser.add_argument("-s", help="special tokens", type=list, default=[
-    "<|eop|>", # end of prompt
-    "<|eor|>", # end of reason
-    "<|eot|>", # end of text
-    "<|sep|>",
-    "<|call|>", # tool call
-    "<|sink|>",
-    "<|mask|>"
+	"<|eop|>", # end of prompt
+	"<|eor|>", # end of reason
+	"<|eot|>", # end of text
+	"<|sep|>",
+	"<|call|>", # tool call
+	"<|sink|>",
+	"<|mask|>"
 ])
 args = parser.parse_args()
 
@@ -32,7 +32,7 @@ CONFIG = {
 
 dir = os.path.split(CONFIG["outpath"])[0]
 if not os.path.isdir(dir):
-    os.mkdir(dir)
+	os.mkdir(dir)
 
 #* set `vocab_size` in `config.json` 4096
 enc.train([CONFIG["dataset_path"], CONFIG["is_dir"]], CONFIG["vocab_size"], text_range=CONFIG["text_range"])

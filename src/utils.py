@@ -35,20 +35,20 @@ def print_banner():
 	print0(banner, save_to_file=False)
 
 def calc_total_time(seconds):
-    # separate the integer part (for hours, minutes, and seconds) from the fractional part (for milliseconds)
-    sec_int, millis = divmod(seconds, 1)
-    millis = int(millis * 1000) # convert the fractional part to milliseconds
+	# separate the integer part (for hours, minutes, and seconds) from the fractional part (for milliseconds)
+	sec_int, millis = divmod(seconds, 1)
+	millis = int(millis * 1000) # convert the fractional part to milliseconds
 
-    min, sec = divmod(int(sec_int), 60)
-    hour, min = divmod(min, 60)
-    hours, minutes, seconds = int(hour), int(min), int(sec)
+	min, sec = divmod(int(sec_int), 60)
+	hour, min = divmod(min, 60)
+	hours, minutes, seconds = int(hour), int(min), int(sec)
 
-    t = [
-        f"{hours} hour" + ("s" if hours > 1 else "") if hours > 0 else None,
-        f"{minutes} minute" + ("s" if minutes > 1 else "") if minutes > 0 else None,
-        f"{seconds} second" + ("s" if seconds > 1 else "") if seconds > 0 else None,
-        f"{millis} ms" if millis > 0 else None
-    ]
-    t = list(filter(None, t))
+	t = [
+		f"{hours} hour" + ("s" if hours > 1 else "") if hours > 0 else None,
+		f"{minutes} minute" + ("s" if minutes > 1 else "") if minutes > 0 else None,
+		f"{seconds} second" + ("s" if seconds > 1 else "") if seconds > 0 else None,
+		f"{millis} ms" if millis > 0 else None
+	]
+	t = list(filter(None, t))
 
-    return ", ".join(t) if t else "0 seconds"
+	return ", ".join(t) if t else "0 seconds"
