@@ -30,8 +30,6 @@ CONFIG = json.loads(open(sys.argv[1], "r", encoding="utf-8").read()) if len(sys.
 		"block_size": 256,
 		"n_layer": 2,
 		"r_layer": 2,
-		"r_alpha": 0.3,
-		"r_beta": 0.7,
 		"n_head": 4,
 		"n_embd": 64,
 		"n_qkv": 256,
@@ -146,10 +144,12 @@ class dataloader:
 		self.path = path
 		self.data_division = data_division
 		self.block_size, self.batch_size = block_size, batch_size
-		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
-		
-		self.ptr = self.block_size
+
 		self.sink_col = torch.full((self.batch_size, 1), sink_tok)
+		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
+
+	def arange(self, n):
+		return torch.arange(random.randint(0, self.block_size//2), n - self.block_size, random.randint(1, self.block_size//2))
 
 	def load_dataset(self):
 		self.train, self.val = [], []
@@ -171,21 +171,29 @@ class dataloader:
 
 		self.train = torch.tensor(self.train, dtype=torch.int64)
 		self.val = torch.tensor(self.val, dtype=torch.int64)
+
+		self.train_ptr = self.val_ptr = 0
+		self.train_range, self.val_range = self.arange(n_train_toks), self.arange(n_val_toks)
 		return n_train_toks, n_val_toks
 
 	def next_batch(self, split):
-		if split == "train":
-			data = self.train
-			ptr = self.ptr + self.block_size * self.batch_size
-			range = self.ptr = random.randint(0, self.block_size) if ptr > len(data) else ptr
+		range = self.train_range if split == "train" else self.val_range
+		ptr = self.train_ptr if split == "train" else self.val_ptr
+		data = self.train if split == "train" else self.val
 
-		else:
-			data = self.val
-			range = len(data) - self.block_size
+		start = ptr * self.batch_size
+		end = start + self.batch_size
 
-		ix = torch.randint(range, (self.batch_size,))
+		if start > len(range):
+			ptr = 0
+			start = 0
+			end = self.batch_size
+
+		ix = range[start:end]
 		y = torch.stack([data[i:i + self.block_size] for i in ix])
 		x = torch.cat([self.sink_col, y[:, :-1]], dim=1) # x: prepend SINK, drop last token
+
+		setattr(self, f"{split}_ptr", ptr + 1)
 		return x.to(device), y.to(device)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
