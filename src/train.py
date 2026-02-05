@@ -145,11 +145,8 @@ class dataloader:
 		self.data_division = data_division
 		self.block_size, self.batch_size = block_size, batch_size
 
-		self.sink_col = torch.full((self.batch_size, 1), sink_tok)
 		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
-
-	def arange(self, n):
-		return torch.arange(random.randint(0, self.block_size//2), n - self.block_size, random.randint(1, self.block_size//2))
+		self.sink_col = torch.full((self.batch_size, 1), sink_tok)
 
 	def load_dataset(self):
 		self.train, self.val = [], []
@@ -171,29 +168,13 @@ class dataloader:
 
 		self.train = torch.tensor(self.train, dtype=torch.int64)
 		self.val = torch.tensor(self.val, dtype=torch.int64)
-
-		self.train_ptr = self.val_ptr = 0
-		self.train_range, self.val_range = self.arange(n_train_toks), self.arange(n_val_toks)
 		return n_train_toks, n_val_toks
 
 	def next_batch(self, split):
-		range = self.train_range if split == "train" else self.val_range
-		ptr = self.train_ptr if split == "train" else self.val_ptr
 		data = self.train if split == "train" else self.val
-
-		start = ptr * self.batch_size
-		end = start + self.batch_size
-
-		if start > len(range):
-			ptr = 0
-			start = 0
-			end = self.batch_size
-
-		ix = range[start:end]
+		ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
 		y = torch.stack([data[i:i + self.block_size] for i in ix])
 		x = torch.cat([self.sink_col, y[:, :-1]], dim=1) # x: prepend SINK, drop last token
-
-		setattr(self, f"{split}_ptr", ptr + 1)
 		return x.to(device), y.to(device)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -357,16 +338,17 @@ for _ in range(n_steps):
 		print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)
 
 	## log test loss
+	### get loss as float. note: this is a CPU-GPU sync point
+	### scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+	lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
+	stats["loss"]["test"].append(lossf)
+
 	if stats["step"] % CONFIG["log_interval"] == 0:
 		test_t1 = time.time()
 		test_dt = test_t1 - test_t0
 		test_t0 = test_t1
 
-		# get loss as float. note: this is a CPU-GPU sync point
-		# scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-		lossf = loss.item() * CONFIG["gradient_accumulation_steps"]
 		toks_per_sec = (CONFIG["batch_size"] * CONFIG["gradient_accumulation_steps"] * hyperparams["block_size"] * CONFIG["log_interval"]) / test_dt
-
 		print0(
 			f"{Fore.WHITE}{Style.BRIGHT}iter",
 			f"{Fore.WHITE}{Style.DIM}[{stats["step"]}/{CONFIG["max_iters"]}]"
@@ -378,7 +360,6 @@ for _ in range(n_steps):
 			f"tok/s {Fore.WHITE}{Style.DIM}{toks_per_sec:.2f}",
 			log_path=log_path
 		)
-		stats["loss"]["test"].append(lossf)
 	stats["step"] += 1
 
 print0("total time:", calc_total_time(time.time() - start_time), log_path=log_path)

@@ -66,9 +66,9 @@ class RetentionMechanism(nn.Module):
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
 		return wc, (
-			norm(wt[0] * F.silu(wc[0])) + norm(wc[0]),
-			norm(wt[1] * F.silu(wc[1])) + norm(wc[1]),
-			norm(wt[2] * F.silu(wc[2])) + norm(wc[2])
+			norm(wt[0]) * F.silu(wc[0]) + norm(wc[0]),
+			norm(wt[1]) * F.silu(wc[1]) + norm(wc[1]),
+			norm(wt[2]) * F.silu(wc[2]) + norm(wc[2])
 		)
 
 	def produce(self, x):
