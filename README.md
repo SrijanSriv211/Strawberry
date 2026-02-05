@@ -1,5 +1,5 @@
 # Strawberry: Is strawberry a fruit or a vegetable?
-Strawberry is primarily an early-stage neural network model architecture built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project. Currently not much is implemented, however everything inside this repository is enough to train AI models of various sizes.
+Strawberry is primarily an early-stage neural network architecture built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project. Currently not much is implemented, however everything inside this repository is enough to train AI models of various sizes.
 
 Strawberry brings several improvements over the standard GPT-2 architecture, such as:
 1. Shared stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
@@ -66,7 +66,7 @@ Start by cloning the repository with `git clone https://github.com/SrijanSriv211
 
 <ins>**2. Configuring the hyperparameters:**</ins>
 
-He configuration object can be found in `train.py` which can also be copy-pasted into a separate `.json` file
+The configuration object can be found in `train.py`, which can also be copy-pasted into a separate `.json` file
 
 ```json
 {
