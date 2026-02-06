@@ -11,6 +11,21 @@ Strawberry brings several improvements over the standard GPT-2 architecture, suc
 7. My custom `Retention Mechanism` architecture
 8. Shared embedding weights
 
+## The Expert Abundance
+MoE-powered attention mechanism & Swiglu MoE-FFN.
+
+- Derive **QKV**, **Swiglu** & **Output projection** weights by the Retention Mechanism's **Update Rule** *(given below)*
+
+```
+Q, K, V     -> Local, Token-level MoE Scaled Dot Product Attention              -> Y
+Y           -> Concatenate all local mixture of attention parts                 -> Y
+Y           -> Swiglu mini-ffn                                                  -> Y
+Y           -> X + out(Y)                                                       -> Y
+```
+
+> [!NOTE]
+> As of now Token-level MoE has not been implemented in The Expert Abundance.
+
 ## Retention Mechanism
 Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
 
@@ -35,29 +50,20 @@ Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
 - Then we update `wC` & `wT` in way given below:
 
 ```python
-wT, wC = wc, (
-    norm(wT[0]) * F.silu(wC[0]) + norm(wC[0]), # update QKV weights
-    norm(wT[1]) * F.silu(wC[1]) + norm(wC[1]), # update swiglu weights
-    norm(wT[2]) * F.silu(wC[2]) + norm(wC[2]) # update output projection weights
-)
+# update QKV, Swiglu and output projection weights
+w_qkv = wT[0] * F.silu(wC[0]) + wC[0]
+w_swiglu = wT[1] * F.silu(wC[1]) + wC[1]
+w_out = wT[2] * F.silu(wC[2]) + wC[2]
+
+# normalize QKV, Swiglu and output projection weights
+w_qkv = self.normalize(w_qkv, self.n_embd)
+w_swiglu = self.normalize(w_swiglu, self.n_qkv)
+w_out = self.normalize(w_out, self.n_embd)
+
+wT, wC = wC, (w_qkv, w_swiglu, w_out)
 ```
 
 - Then we again perform the attention on new `wC` and this cycle continues.
-
-## The Expert Abundance
-MoE-powered attention mechanism & Swiglu MoE-FFN.
-
-- Derive **QKV**, **Swiglu** & **Output projection** weights by the Retention Mechanism's **Update Rule**
-
-```
-Q, K, V     -> Local, Token-level MoE Scaled Dot Product Attention              -> Y
-Y           -> Concatenate all local mixture of attention parts                 -> Y
-Y           -> Swiglu mini-ffn                                                  -> Y
-Y           -> X + out(Y)                                                       -> Y
-```
-
-> [!NOTE]
-> As of now Token-level MoE has not been implemented in The Expert Abundance.
 
 ## Getting Started
 <ins>**1. Downloading the repository:**</ins>
@@ -83,8 +89,8 @@ The configuration object can be found in `train.py`, which can also be copy-past
 	"model_hyperparams": {
 		"vocab_size": 8192,
 		"block_size": 256,
-		"n_layer": 2, // number of layers you want
 		"r_layer": 2, // number of "virtual" layers the retention mechanism will work with
+		"n_layer": 2, // number of layers you want
 		"n_head": 4,
 		"n_embd": 64,
 		"n_qkv": 256,
