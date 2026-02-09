@@ -138,7 +138,7 @@ The configuration object can be found in `train.py`, which can also be copy-past
     title={Strawberry},
     url={https://github.com/SrijanSriv211/Strawberry},
     version={0.1.0},
-    year = {2025}
+    year = {2026}
 }
 ```
 
