@@ -56,12 +56,11 @@ class RetentionMechanism(nn.Module):
 		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
 		self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
 
-		# merged QKV weights
-		self.w_attn_qkv = CastedLinear(config.n_embd, 3*config.n_qkv).weight
-
-		# out projection weights
-		self.w_attn_swiglu = CastedLinear(config.n_qkv, 2*config.n_embd).weight
-		self.w_attn_out = CastedLinear(config.n_embd, config.n_embd).weight
+		# merged QKV weights & out proj weights
+		# fixed/pre-trained attention qkv, swiglu and out weights
+		# w_attn_qkv shape: (C, 3*D); w_attn_swiglu shape: (D, 2*C); w_attn_out shape: (C, C)
+		self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out = torch.split(self.t.weight, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+		self.w_attn_swiglu = self.w_attn_swiglu.reshape(2*self.n_embd, self.n_qkv)
 
 	# normalize here (fixes initial scale)
 	def w_norm(self, w, n):
@@ -70,10 +69,12 @@ class RetentionMechanism(nn.Module):
 
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
+		# update QKV, Swiglu and output projection weights
 		w_qkv = wt[0] * F.silu(wc[0]) + wc[0]
 		w_swiglu = wt[1] * F.silu(wc[1]) + wc[1]
 		w_out = wt[2] * F.silu(wc[2]) + wc[2]
 
+		# normalize QKV, Swiglu and output projection weights
 		w_qkv = self.w_norm(w_qkv, self.n_embd)
 		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
 		w_out = self.w_norm(w_out, self.n_embd)

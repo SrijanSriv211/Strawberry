@@ -45,16 +45,43 @@ if __name__ == "__main__":
 	print_banner()
 
 	parser = argparse.ArgumentParser(description="A powerful text encryption and decryption program.")
-	parse_prompt = parser.add_mutually_exclusive_group()
 	parser.add_argument("--model", "-i", help="model path", required=True)
 	parser.add_argument("--encoder", "-e", help="encoder path", required=True)
 	parser.add_argument("--length", "-l", help="output length", type=int, default=256)
 	parser.add_argument("--temperature", "-t", help="output temperature", type=float, default=0.8)
 	parser.add_argument("--top_k", "-f", help="output top_k", type=int, default=None)
-	parse_prompt.add_argument("--text_prompt", "-T", help="Text input from the command line.")
+	parser.add_argument("--text_prompt", "-T", help="Text input from the command line.", default=None)
 	args = parser.parse_args()
 
-	# load text from the text file.
-	text = args.text_prompt if args.text_prompt else None
-	out = generate(torch.load(args.model), args.encoder, args.length, args.temperature, args.top_k, text)
-	print(f"{Fore.WHITE}{Style.DIM}```\n{out}\n```\n")
+	texts = [
+		"Steve Jobs made the soul of Apple",
+		"Red Dead Redemption 2 is the best game of all time",
+		"Arthur Morgan: We are bad men, but we ain't them",
+		"ENZO: I was willing to die for this family. But now I have to live for my own.\nISABELLA:",
+		"LLMs like GPT-3 and GPT 4 show remarkable scaling laws",
+		"GTA 3 is one of the loneliest Grand Theft Auto game ever made",
+		"This language model is just plain dumb",
+		"Google ",
+		"Hello I'm a language model, and ",
+		"Can I say that Calcia is really a branch of math or is it something nonsense",
+		"Every year the moon is going",
+		"o/ The workings of the Undetailed",
+		"import flask",
+		"int main(int argc, char const *argv[])\n{",
+		"<body>\n",
+		"",
+		"",
+		""
+	] if args.text_prompt is None else [args.text_prompt]
+
+	for text in texts:
+		print(f"{Fore.WHITE}{Style.BRIGHT}> {text}")
+
+		if text == "/q":
+			break
+
+		elif text.strip() == "":
+			text = None
+
+		out = generate(torch.load(args.model), args.encoder, args.length, args.temperature, args.top_k, text)
+		print(f"{Fore.WHITE}{Style.DIM}{out}\n")
