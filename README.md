@@ -1,4 +1,7 @@
 # Strawberry: Is strawberry a fruit or a vegetable?
+
+<img src="img/strawberry.png" alt="howmanyrsinthewordstrawberry" style="width:100%;">
+
 Strawberry is primarily an early-stage neural network architecture built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project. Currently not much is implemented, however everything inside this repository is enough to train AI models of various sizes.
 
 Strawberry brings several improvements over the standard GPT-2 architecture, such as:
@@ -56,10 +59,11 @@ w_swiglu = wT[1] * F.silu(wC[1]) + wC[1]
 w_out = wT[2] * F.silu(wC[2]) + wC[2]
 
 # normalize QKV, Swiglu and output projection weights
-w_qkv = self.normalize(w_qkv, self.n_embd)
-w_swiglu = self.normalize(w_swiglu, self.n_qkv)
-w_out = self.normalize(w_out, self.n_embd)
+w_qkv = self.w_norm(w_qkv, self.n_embd)
+w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
+w_out = self.w_norm(w_out, self.n_embd)
 
+# swap
 wT, wC = wC, (w_qkv, w_swiglu, w_out)
 ```
 
