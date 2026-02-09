@@ -63,22 +63,22 @@ class RetentionMechanism(nn.Module):
 		self.w_attn_swiglu = CastedLinear(config.n_qkv, 2*config.n_embd).weight
 		self.w_attn_out = CastedLinear(config.n_embd, config.n_embd).weight
 
+	# normalize here (fixes initial scale)
+	def w_norm(self, w, n):
+		target_std = n ** -0.5
+		return w * (target_std / (w.std() + 1e-8))
+
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
 		w_qkv = wt[0] * F.silu(wc[0]) + wc[0]
 		w_swiglu = wt[1] * F.silu(wc[1]) + wc[1]
 		w_out = wt[2] * F.silu(wc[2]) + wc[2]
 
-		w_qkv = self.normalize(w_qkv, self.n_embd)
-		w_swiglu = self.normalize(w_swiglu, self.n_qkv)
-		w_out = self.normalize(w_out, self.n_embd)
+		w_qkv = self.w_norm(w_qkv, self.n_embd)
+		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
+		w_out = self.w_norm(w_out, self.n_embd)
 
 		return wc, (w_qkv, w_swiglu, w_out)
-
-	# normalize here (fixes initial scale)
-	def normalize(self, w, n):
-		target_std = n ** -0.5
-		return w * (target_std / (w.std() + 1e-8))
 
 	def produce(self, x):
 		# batch size, sequence length, embedding dimensionality (n_embd)
@@ -94,16 +94,14 @@ class RetentionMechanism(nn.Module):
 		y = F.softmax(y, dim=-1)
 
 		# transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-		y = self.t(y).T
+		y = self.t.weight @ y
+
+		# normalize here (fixes initial scale)
+		y = self.w_norm(y, 5 * self.n_qkv + self.n_embd)
 
 		# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 		w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
 		w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
-
-		# normalize here (fixes initial scale)
-		w_qkv = self.normalize(w_qkv, self.n_embd)
-		w_swiglu = self.normalize(w_swiglu, self.n_qkv)
-		w_out = self.normalize(w_out, self.n_embd)
 
 		return (self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out), (w_qkv, w_swiglu, w_out)
 
