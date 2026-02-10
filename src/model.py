@@ -6,6 +6,7 @@ import torch.nn as nn, torch, math
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
+	local_block_size: int = 256
 	n_layer: int = 2 # new layers
 	r_layer: int = 2 # reuse layers
 	n_head: int = 4
@@ -70,14 +71,14 @@ class RetentionMechanism(nn.Module):
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
 		# update QKV, Swiglu and output projection weights
-		w_qkv = wt[0] * F.silu(wc[0]) + wc[0]
+		w_qkv 	 = wt[0] * F.silu(wc[0]) + wc[0]
 		w_swiglu = wt[1] * F.silu(wc[1]) + wc[1]
-		w_out = wt[2] * F.silu(wc[2]) + wc[2]
+		w_out 	 = wt[2] * F.silu(wc[2]) + wc[2]
 
 		# normalize QKV, Swiglu and output projection weights
-		w_qkv = self.w_norm(w_qkv, self.n_embd)
+		w_qkv 	 = self.w_norm(w_qkv, self.n_embd)
 		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
-		w_out = self.w_norm(w_out, self.n_embd)
+		w_out 	 = self.w_norm(w_out, self.n_embd)
 
 		return wc, (w_qkv, w_swiglu, w_out)
 
@@ -195,8 +196,9 @@ class Block(nn.Module):
 		# wc -> current weights; wt -> transform weights
 		wc, wt = self.retain.produce(x)
 
-		for _ in range(self.r_layer):
-			x = self.aft(x, wc)
+		# after 3 every consecutive global-linear attentions, apply 1 local-scaled-dot-product attention
+		for i in range(self.r_layer):
+			x = self.tea(x, cos_sin, wc) if (i + 1) % 4 == 0 else self.aft(x, wc)
 			wt, wc = self.retain(wt, wc)
 
 		x = self.tea(x, cos_sin, wc)
