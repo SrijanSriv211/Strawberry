@@ -51,58 +51,33 @@ class LatentCompaction(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 
-		# linear layer whose weight matrix is used as learned latent tokens.
-		# these act as fixed learned queries during compaction.
-		self.latent = CastedLinear(config.n_embd, config.latent_block_size)
-
-		# merged QKV weights
-		self.q = CastedLinear(config.n_embd, config.n_embd)
-		self.kv = CastedLinear(config.n_embd, 2*config.n_embd)
+		# merged OAT weights
+		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
+		self.t = CastedLinear(config.n_embd, config.latent_block_size)
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
-	# (B, T, C) -> (B, L, C)
 	def forward(self, x):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, C = x.size()
 
-		# calculate qkv values
-		# use the latent weight matrix as learned latent tokens.
-		q = self.q(norm(self.latent.weight.unsqueeze(0))) # (1, L, C)
+		# calculate orignal & adjust values
+		o, a = self.oa(norm(x)).chunk(2, dim=-1) # (B, T, C)
+		o, a = norm(o), norm(a)
 
-		# project input tokens into key and value space.
-		k, v = self.kv(norm(x)).chunk(2, dim=-1) # (B, T, C)
-		k, v = norm(k), norm(v)
+		# compact context of shape (B, T, C) into a latent space of shape (B, C, C)
+		scale_factor = 1 / math.sqrt(C)
+		y = o.transpose(-2, -1) @ a * scale_factor
 
-		# context compaction into latent space using attention
-		# latent queries attend over token keys.
-        # (1, L, C) @ (B, C, T) -> (B, L, T)
-		scale = 1 / math.sqrt(C)
-		attn = torch.softmax(q @ k.transpose(-2, -1) * scale, dim=-1)
-
-		# (B, L, T) @ (B, T, C) -> (B, L, C)
-		return self.out(attn @ v)
+		# (B, C, C) -> (B, L, C) where `L` is the latent context len
+		y = self.t(y).transpose(1, 2)
+		xi = self.out(o * F.silu(a))
+		return xi, y
 
 	# (B, L, C) -> (B, T, C)
 	def decompact(self, xi, xs):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = xi.size()
-
-		# tokens now act as queries.
-		q = self.q(norm(xi)) # (B, T, C)
-
-		# latents act as keys and values.
-		k, v = self.kv(norm(xs)).chunk(2, dim=-1)
-		k, v = norm(k), norm(v)
-
-        # tokens attend to latent summaries.
-        # (B, T, C) @ (B, C, L) -> (B, T, L)
-		scale = 1 / math.sqrt(C)
-		attn = torch.softmax(q @ k.transpose(-2, -1) * scale, dim=-1)
-
-        # reconstruct token-level representations.
-        # (B, T, L) @ (B, L, C) -> (B, T, C)
-		x_recon = attn @ v
-		return xi + self.out(x_recon)
+		xs_mean = torch.mean(xs, dim=0) # (B, L, C) -> (L, C)
+		y = xs_mean.T @ self.t.weight # (L, C) -> (C, C)
+		return xi @ y # (B, L, C) -> (B, T, C)
 
 class RetentionMechanism(nn.Module):
 	def __init__(self, config: Config):
@@ -306,10 +281,10 @@ class Strawberry(nn.Module):
 
 		# token embeddings of shape (b, t, n_embd)
 		x = self.embed(idx)
-		xi = x = norm(x)
+		x = norm(x)
 
 		# compact `x` into latent space
-		x = self.mlc(x)
+		xi, x = self.mlc(x)
 
 		for block in self.blocks:
 			x = block(x, cos_sin)
