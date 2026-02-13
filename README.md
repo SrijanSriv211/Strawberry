@@ -53,10 +53,19 @@ Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
 - Then we update `wC` & `wT` in way given below:
 
 ```python
+self.scale = (self.n_embd ** -0.5, self.n_qkv ** -0.5, self.n_embd ** -0.5)
+
+# delta QKV, Swiglu and output projection weights
+w = (
+	(F.silu(wC[0]) * wT[0]) @ (wC[0].T @ wT[0] * self.scale[0]),
+	(F.silu(wC[1]) * wT[1]) @ (wC[1].T @ wT[1] * self.scale[1]),
+	(F.silu(wC[2]) * wT[2]) @ (wC[2].T @ wT[2] * self.scale[2])
+)
+
 # update QKV, Swiglu and output projection weights
-w_qkv 	 = wT[0] * F.silu(wC[0]) + wC[0]
-w_swiglu = wT[1] * F.silu(wC[1]) + wC[1]
-w_out 	 = wT[2] * F.silu(wC[2]) + wC[2]
+w_qkv 	 = w[0] + wC[0]
+w_swiglu = w[1] + wC[1]
+w_out 	 = w[2] + wC[2]
 
 # normalize QKV, Swiglu and output projection weights
 w_qkv 	 = self.w_norm(w_qkv, self.n_embd)

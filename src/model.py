@@ -62,6 +62,8 @@ class RetentionMechanism(nn.Module):
 		self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out = torch.split(self.t.weight, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
 		self.w_attn_swiglu = self.w_attn_swiglu.reshape(2*self.n_embd, self.n_qkv)
 
+		self.scale = (self.n_embd ** -0.5, self.n_qkv ** -0.5, self.n_embd ** -0.5)
+
 	# normalize here (fixes initial scale)
 	def w_norm(self, w, n):
 		target_std = n ** -0.5
@@ -69,10 +71,17 @@ class RetentionMechanism(nn.Module):
 
 	# return the new "old" & "current" weights.
 	def forward(self, wt, wc):
+		# delta QKV, Swiglu and output projection weights
+		w = (
+			(F.silu(wc[0]) * wt[0]) @ (wc[0].T @ wt[0] * self.scale[0]),
+			(F.silu(wc[1]) * wt[1]) @ (wc[1].T @ wt[1] * self.scale[1]),
+			(F.silu(wc[2]) * wt[2]) @ (wc[2].T @ wt[2] * self.scale[2])
+		)
+
 		# update QKV, Swiglu and output projection weights
-		w_qkv 	 = wt[0] * F.silu(wc[0]) + wc[0]
-		w_swiglu = wt[1] * F.silu(wc[1]) + wc[1]
-		w_out 	 = wt[2] * F.silu(wc[2]) + wc[2]
+		w_qkv 	 = w[0] + wc[0]
+		w_swiglu = w[1] + wc[1]
+		w_out 	 = w[2] + wc[2]
 
 		# normalize QKV, Swiglu and output projection weights
 		w_qkv 	 = self.w_norm(w_qkv, self.n_embd)

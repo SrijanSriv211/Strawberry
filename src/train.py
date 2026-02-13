@@ -5,6 +5,7 @@ from optimizer import Muon
 
 from colorama import Style, Fore, init
 from rich.progress import track
+from itertools import chain
 
 import random, pickle, torch, json, time, math, sys, os
 
@@ -155,12 +156,15 @@ class dataloader:
 				dataset = pickle.load(f)["dataset"]
 
 			random.shuffle(dataset)
-
-			for data in dataset:
-				n_train_toks = int(len(data) * self.data_division)
-				self.train.extend(data[:n_train_toks])
-				self.val.extend(data[n_train_toks:])
+			flat_dataset = chain.from_iterable(dataset)
 			del dataset
+
+			flat_dataset = list(flat_dataset)
+			n_train_toks = int(len(flat_dataset) * self.data_division)
+			n_val_toks = len(flat_dataset) - n_train_toks
+
+			self.train.extend(flat_dataset[:n_train_toks])
+			self.val.extend(flat_dataset[n_train_toks:])
 
 		n_train_toks, n_val_toks = len(self.train), len(self.val)
 		self.train = torch.tensor(self.train, dtype=torch.int64)
