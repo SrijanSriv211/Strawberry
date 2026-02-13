@@ -6,7 +6,6 @@ import torch.nn as nn, torch, math
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
-	latent_block_size: int = 256
 	n_layer: int = 2 # new layers
 	r_layer: int = 2 # reuse layers
 	n_head: int = 4
@@ -46,38 +45,6 @@ class CastedLinear(nn.Module):
 
 	def forward(self, x):
 		return F.linear(x, self.weight)
-
-class LatentCompaction(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-
-		# merged OAT weights
-		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
-		self.t = CastedLinear(config.n_embd, config.latent_block_size)
-		self.out = CastedLinear(config.n_embd, config.n_embd)
-
-	def forward(self, x):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = x.size()
-
-		# calculate orignal & adjust values
-		o, a = self.oa(norm(x)).chunk(2, dim=-1) # (B, T, C)
-		o, a = norm(o), norm(a)
-
-		# compact context of shape (B, T, C) into a latent space of shape (B, C, C)
-		scale_factor = 1 / math.sqrt(C)
-		y = o.transpose(-2, -1) @ a * scale_factor
-
-		# (B, C, C) -> (B, L, C) where `L` is the latent context len
-		y = self.t(y).transpose(1, 2)
-		xi = self.out(o * F.silu(a))
-		return xi, y
-
-	# (B, L, C) -> (B, T, C)
-	def decompact(self, xi, xs):
-		xs_mean = torch.mean(xs, dim=0) # (B, L, C) -> (L, C)
-		y = xs_mean.T @ self.t.weight # (L, C) -> (C, C)
-		return xi @ y # (B, L, C) -> (B, T, C)
 
 class RetentionMechanism(nn.Module):
 	def __init__(self, config: Config):
@@ -249,9 +216,6 @@ class Strawberry(nn.Module):
 		self.unembed = CastedLinear(config.n_embd, config.vocab_size)
 		self.embed.weight = self.unembed.weight
 
-		# compact the context into a latent space
-		self.mlc = LatentCompaction(config)
-
 		# to support meta device initialization, we init the rotary embeddings here, but it's fake
 		# as for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
 		# so let's just over-compute them, but assert fail if we ever reach that amount.
@@ -273,24 +237,17 @@ class Strawberry(nn.Module):
 
 	def forward(self, idx, targets=None):
 		B, T = idx.size()
-		L = self.config.latent_block_size
 
-		# grab the rotary embeddings for the current sequence length (they are of shape (1, latent_seq_len, 1, head_dim))
-		assert L <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {L} > {self.cos.size(1)}"
-		cos_sin = self.cos[:, :+L], self.sin[:, :+L]
+		# grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
+		assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+		cos_sin = self.cos[:, :+T], self.sin[:, :+T]
 
 		# token embeddings of shape (b, t, n_embd)
 		x = self.embed(idx)
 		x = norm(x)
 
-		# compact `x` into latent space
-		xi, x = self.mlc(x)
-
 		for block in self.blocks:
 			x = block(x, cos_sin)
-
-		# decompact `x` from latent space into original space
-		x = self.mlc.decompact(xi, x)
 
 		# forward the lm_head (compute logits)
 		x = norm(x)
