@@ -144,7 +144,7 @@ class dataloader:
 		self.data_division = data_division
 		self.block_size, self.batch_size = block_size, batch_size
 
-		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path)]
+		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path) if os.path.isfile(os.path.join(path, i))]
 		self.sink_col = torch.full((self.batch_size, 1), sink_tok)
 
 	def load_dataset(self):
