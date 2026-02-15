@@ -53,17 +53,18 @@ class RetentionMechanism(nn.Module):
 		self.n_qkv = config.n_qkv
 
 		self.w_qkvo = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
+		# self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	# update rule for retention of weights.
 	# wc -> current weights; wt -> transform weights
 	def forward(self, wC, oa):
 		# transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
 		wT = wC @ oa
-		self.w_norm(wT, self.n_embd)
+		wT = self.w_norm(wT, 5*self.n_qkv + self.n_embd)
 
 		# update QKV, Swiglu and output projection weights
-		w = wT * F.silu(wC) + wC
-		return self.w_norm(w, self.n_embd)
+		return wT * F.silu(wC) + wC
+		# return wC + self.out(w)
 
 	# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 	def w_split(self, w):
@@ -157,6 +158,8 @@ class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 		self.r_layer = config.r_layer
+		self.n_embd = config.n_embd
+		self.n_qkv = config.n_qkv
 
 		self.retain = RetentionMechanism(config)
 		self.aft = AttentionFreeTransformer()
@@ -169,13 +172,16 @@ class Block(nn.Module):
 		for i in range(self.r_layer):
 			# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
+			w_qkv 	 = self.retain.w_norm(w_qkv, self.n_embd)
+			w_swiglu = self.retain.w_norm(w_swiglu, self.n_qkv)
+			w_out 	 = self.retain.w_norm(w_out, self.n_embd)
 
 			# 3 consecutive global-context linear attention, 1 local-context scaled dot product attention
 			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
 			x, oa = self.swiglu(x, y, w_swiglu, w_out)
 
 			# retention update rule to update qkvo params
-			w = 2 * self.retain(w, oa)
+			w = self.retain(w, oa)
 
 		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
