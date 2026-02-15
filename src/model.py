@@ -53,7 +53,6 @@ class RetentionMechanism(nn.Module):
 		self.n_qkv = config.n_qkv
 
 		self.w_qkvo = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
-		# self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	# update rule for retention of weights.
 	# wc -> current weights; wt -> transform weights
@@ -64,7 +63,6 @@ class RetentionMechanism(nn.Module):
 
 		# update QKV, Swiglu and output projection weights
 		return wT * F.silu(wC) + wC
-		# return wC + self.out(w)
 
 	# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 	def w_split(self, w):
@@ -147,7 +145,7 @@ class Swiglu(nn.Module):
 		# (B, T, C) -> (B*T, C) -> (C, C)
 		# use UV vals for orignal & adjust values
 		o, a = u.view(B*T, -1), v.view(B*T, -1)
-		o, a = norm(o), (a)
+		o, a = norm(o), norm(a)
 
 		# compact O & A of shape (B*T, C) -> (C, C) shape
 		oa = o.T @ a * (C ** -0.5)
@@ -167,24 +165,24 @@ class Block(nn.Module):
 		self.swiglu = Swiglu()
 
 	def forward(self, x, cos_sin):
+		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 		w = self.retain.w_qkvo.weight
+		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
 
 		for i in range(self.r_layer):
-			# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
-			w_qkv 	 = self.retain.w_norm(w_qkv, self.n_embd)
-			w_swiglu = self.retain.w_norm(w_swiglu, self.n_qkv)
-			w_out 	 = self.retain.w_norm(w_out, self.n_embd)
-
 			# 3 consecutive global-context linear attention, 1 local-context scaled dot product attention
 			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
 			x, oa = self.swiglu(x, y, w_swiglu, w_out)
 
 			# retention update rule to update qkvo params
 			w = self.retain(w, oa)
-
-		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
+			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
+			# w_qkv 	 = self.retain.w_norm(w_qkv, self.n_embd)
+			# w_swiglu = self.retain.w_norm(w_swiglu, self.n_qkv)
+			# w_out 	 = self.retain.w_norm(w_out, self.n_embd)
+			w_qkv 	 = norm(w_qkv)
+			w_swiglu = norm(w_swiglu)
+			w_out 	 = norm(w_out)
 
 		# one final local-context spda & swiglu ffn
 		x, y = self.tea(x, cos_sin, w_qkv)
