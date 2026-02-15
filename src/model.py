@@ -57,12 +57,13 @@ class RetentionMechanism(nn.Module):
 	# update rule for retention of weights.
 	# wc -> current weights; wt -> transform weights
 	def forward(self, wC, oa):
-		# transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-		wT = wC @ oa
-		wT = self.w_norm(wT, 5*self.n_qkv + self.n_embd)
+		return wC @ oa
+		# # transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
+		# wT = wC @ oa
+		# wT = self.w_norm(wT, 5*self.n_qkv + self.n_embd)
 
-		# update QKV, Swiglu and output projection weights
-		return wT * F.silu(wC) + wC
+		# # update QKV, Swiglu and output projection weights
+		# return wT * F.silu(wC) + wC
 
 	# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 	def w_split(self, w):
@@ -177,9 +178,6 @@ class Block(nn.Module):
 			# retention update rule to update qkvo params
 			w = self.retain(w, oa)
 			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
-			# w_qkv 	 = self.retain.w_norm(w_qkv, self.n_embd)
-			# w_swiglu = self.retain.w_norm(w_swiglu, self.n_qkv)
-			# w_out 	 = self.retain.w_norm(w_out, self.n_embd)
 			w_qkv 	 = norm(w_qkv)
 			w_swiglu = norm(w_swiglu)
 			w_out 	 = norm(w_out)
