@@ -1,6 +1,6 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, math
+import torch.nn as nn, torch
 
 @dataclass
 class Config:
@@ -52,77 +52,53 @@ class RetentionMechanism(nn.Module):
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		# merged OAT weights
-		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
-		self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
+		self.w_qkvo = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
 
-		# merged QKV weights & out proj weights
-		# fixed/pre-trained attention qkv, swiglu and out weights
-		# w_attn_qkv shape: (C, 3*D); w_attn_swiglu shape: (D, 2*C); w_attn_out shape: (C, C)
-		self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out = torch.split(self.t.weight, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
-		self.w_attn_swiglu = self.w_attn_swiglu.reshape(2*self.n_embd, self.n_qkv)
+	# update rule for retention of weights.
+	# def forward(self, w, oa):
+	# 	w = w + F.silu(w) * (w @ oa)
 
-		self.scale = (self.n_embd ** -0.5, self.n_qkv ** -0.5, self.n_embd ** -0.5)
+	# 	# normalize here (fixes initial scale)
+	# 	target_std = self.n_embd ** -0.5
+	# 	return w * (target_std / (w.std() + 1e-8))
 
+	# # update rule for retention of weights.
+	# def forward(self, wC, oa):
+	# 	wT = wC @ oa
+	# 	w = wC * F.silu(wT) + wC
+
+	# 	# normalize here (fixes initial scale)
+	# 	target_std = self.n_embd ** -0.5
+	# 	return w * (target_std / (w.std() + 1e-8))
+
+	# update rule for retention of weights.
+	# wc -> current weights; wt -> transform weights
+	def forward(self, wC, oa):
+		# transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
+		wT = wC @ oa
+		self.w_norm(wT, self.n_embd)
+
+		# update QKV, Swiglu and output projection weights
+		w = wT * F.silu(wC) + wC
+		return self.w_norm(w, self.n_embd)
+
+	# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+	def w_split(self, w):
+		w_qkv, w_swiglu, w_out = torch.split(w, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+		w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
+		return w_qkv, w_swiglu, w_out
+	
 	# normalize here (fixes initial scale)
 	def w_norm(self, w, n):
 		target_std = n ** -0.5
 		return w * (target_std / (w.std() + 1e-8))
-
-	# return the new "old" & "current" weights.
-	def forward(self, wt, wc):
-		# delta QKV, Swiglu and output projection weights
-		w = (
-			(F.silu(wc[0]) * wt[0]) @ (wc[0].T @ wt[0] * self.scale[0]),
-			(F.silu(wc[1]) * wt[1]) @ (wc[1].T @ wt[1] * self.scale[1]),
-			(F.silu(wc[2]) * wt[2]) @ (wc[2].T @ wt[2] * self.scale[2])
-		)
-
-		# update QKV, Swiglu and output projection weights
-		w_qkv 	 = w[0] + wc[0]
-		w_swiglu = w[1] + wc[1]
-		w_out 	 = w[2] + wc[2]
-
-		# normalize QKV, Swiglu and output projection weights
-		w_qkv 	 = self.w_norm(w_qkv, self.n_embd)
-		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
-		w_out 	 = self.w_norm(w_out, self.n_embd)
-
-		return wc, (w_qkv, w_swiglu, w_out)
-
-	def produce(self, x):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = x.size()
-
-		# calculate orignal & adjust values
-		o, a = self.oa(norm(x)).view(B*T, -1).chunk(2, dim=-1) # (B*T, C)
-		o, a = norm(o), norm(a)
-
-		# compact O & A of shape (B*T, C) -> (C, C) shape
-		scale_factor = 1 / math.sqrt(C)
-		y = o.T @ a * scale_factor
-		y = F.softmax(y, dim=-1)
-
-		# transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-		y = self.t.weight @ y
-
-		# normalize here (fixes initial scale)
-		y = self.w_norm(y, 5 * self.n_qkv + self.n_embd)
-
-		# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-		w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
-		w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
-
-		return (self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out), (w_qkv, w_swiglu, w_out)
 
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
 	def __init__(self):
 		super().__init__()
 
-	def forward(self, x, w):
-		w_qkv, w_swiglu, w_out = w
-
+	def forward(self, x, w_qkv):
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v = F.linear(norm(x), w_qkv).chunk(3, dim=-1) # (B, T, C)
 		q, k = norm(q), norm(k) # QK norm
@@ -139,11 +115,7 @@ class AttentionFreeTransformer(nn.Module):
 		y = kv / (w + 1e-6)
 
 		# gate with query
-		y = F.sigmoid(q) * y
-
-		# output projection
-		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
-		return x + F.linear(u * F.silu(v), w_out)
+		return x, F.sigmoid(q) * y
 
 # new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
@@ -152,12 +124,9 @@ class TheExpertAbundance(nn.Module):
 		self.d_head = config.n_qkv // config.n_head
 		self.n_head = config.n_head
 
-	def forward(self, x, cos_sin, w):
+	def forward(self, x, cos_sin, w_qkv):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
-
-		# retention mechanism produced qkv, swiglu & out proj weights
-		w_qkv, w_swiglu, w_out = w
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v = F.linear(norm(x), w_qkv).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
@@ -174,21 +143,33 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		return x, y.transpose(1, 2).contiguous().view(B, T, -1)
+
+class Swiglu(nn.Module):
+	def __init__(self):
+		super().__init__()
+
+	def forward(self, x, y, w_swiglu, w_out, oa=True):
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, C = x.size()
 
 		# output projection
 		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
-		return x + F.linear(u * F.silu(v), w_out)
+		y = x + F.linear(u * F.sigmoid(v), w_out)
 
-class Swiglu(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.swiglu = CastedLinear(config.n_embd, config.n_ffn*2)
-		self.out = CastedLinear(config.n_ffn, config.n_embd)
+		if not oa:
+			return y
 
-	def forward(self, x):
-		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
-		return x + self.out(u * F.silu(v))
+		# (B, T, C) -> (B*T, C) -> (C, C)
+		# oa = F.silu(norm(u.view(B*T, -1)).T) @ norm(v.view(B*T, -1))
+		# use UV vals for orignal & adjust values
+		o, a = u.view(B*T, -1), v.view(B*T, -1)
+		o, a = norm(o), (a)
+
+		# compact O & A of shape (B*T, C) -> (C, C) shape
+		oa = o.T @ a * (C ** -0.5)
+		oa = F.softmax(oa, dim=-1)
+		return y, oa
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
@@ -198,19 +179,28 @@ class Block(nn.Module):
 		self.retain = RetentionMechanism(config)
 		self.aft = AttentionFreeTransformer()
 		self.tea = TheExpertAbundance(config)
-		self.swiglu = Swiglu(config)
+		self.swiglu = Swiglu()
 
 	def forward(self, x, cos_sin):
-		# wc -> current weights; wt -> transform weights
-		wc, wt = self.retain.produce(x)
+		w = self.retain.w_qkvo.weight
 
-		# after 3 every consecutive global-linear attentions, apply 1 local-scaled-dot-product attention
 		for i in range(self.r_layer):
-			x = self.tea(x, cos_sin, wc) if (i + 1) % 4 == 0 else self.aft(x, wc)
-			wt, wc = self.retain(wt, wc)
+			# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
 
-		x = self.tea(x, cos_sin, wc)
-		return self.swiglu(x)
+			# 3 consecutive global-context linear attention, 1 local-context scaled dot product attention
+			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
+			x, oa = self.swiglu(x, y, w_swiglu, w_out)
+
+			# retention update rule to update qkvo params
+			w = self.retain(w, oa)
+
+		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
+
+		# one final local-context spda & swiglu ffn
+		x, y = self.tea(x, cos_sin, w_qkv)
+		return self.swiglu(x, y, w_swiglu, w_out, oa=False)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
