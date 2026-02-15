@@ -7,13 +7,9 @@ class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
 	n_layer: int = 2 # new layers
-	r_layer: int = 2 # reuse layers
 	n_head: int = 4
 	n_embd: int = 64
 	n_qkv: int = 256
-	n_ffn: int = 256
-	n_experts: int = 4 # total experts
-	a_experts: int = 2 # active experts
 
 def norm(x):
 	return F.rms_norm(x, (x.size(-1),))
@@ -46,42 +42,15 @@ class CastedLinear(nn.Module):
 	def forward(self, x):
 		return F.linear(x, self.weight)
 
-class RetentionMechanism(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.n_embd = config.n_embd
-		self.n_qkv = config.n_qkv
-
-		self.w_qkvo = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
-
-	# update rule for retention of weights.
-	# wc -> current weights; wt -> transform weights
-	def forward(self, wC, oa):
-		return wC @ oa
-		# # transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
-		# wT = wC @ oa
-		# wT = self.w_norm(wT, 5*self.n_qkv + self.n_embd)
-
-		# # update QKV, Swiglu and output projection weights
-		# return wT * F.silu(wC) + wC
-
-	# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-	def w_split(self, w):
-		w_qkv, w_swiglu, w_out = torch.split(w, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
-		w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
-		return w_qkv, w_swiglu, w_out
-	
-	# normalize here (fixes initial scale)
-	def w_norm(self, w, n):
-		target_std = n ** -0.5
-		return w * (target_std / (w.std() + 1e-8))
-
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
 	def __init__(self):
 		super().__init__()
 
-	def forward(self, x, w_qkv):
+	def forward(self, x, w):
+		# retention mechanism produced qkv, swiglu & out proj weights
+		w_qkv, w_swiglu, w_out = w
+
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v = F.linear(norm(x), w_qkv).chunk(3, dim=-1) # (B, T, C)
 		q, k = norm(q), norm(k) # QK norm
@@ -98,7 +67,11 @@ class AttentionFreeTransformer(nn.Module):
 		y = kv / (w + 1e-6)
 
 		# gate with query
-		return x, F.sigmoid(q) * y
+		y = F.sigmoid(q) * y
+
+		# output projection
+		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
+		return x + F.linear(u * F.silu(v), w_out)
 
 # new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
@@ -107,9 +80,12 @@ class TheExpertAbundance(nn.Module):
 		self.d_head = config.n_qkv // config.n_head
 		self.n_head = config.n_head
 
-	def forward(self, x, cos_sin, w_qkv):
+	def forward(self, x, cos_sin, w):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
+
+		# retention mechanism produced qkv, swiglu & out proj weights
+		w_qkv, w_swiglu, w_out = w
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v = F.linear(norm(x), w_qkv).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
@@ -126,65 +102,42 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		return x, y.transpose(1, 2).contiguous().view(B, T, -1)
-
-class Swiglu(nn.Module):
-	def __init__(self):
-		super().__init__()
-
-	def forward(self, x, y, w_swiglu, w_out, oa=True):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = x.size()
+		y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
 		# output projection
 		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
-		y = x + F.linear(u * F.silu(v), w_out)
-
-		if not oa:
-			return y
-
-		# (B, T, C) -> (B*T, C) -> (C, C)
-		# use UV vals for orignal & adjust values
-		o, a = u.view(B*T, -1), v.view(B*T, -1)
-		o, a = norm(o), norm(a)
-
-		# compact O & A of shape (B*T, C) -> (C, C) shape
-		oa = o.T @ a * (C ** -0.5)
-		oa = F.softmax(oa, dim=-1)
-		return y, oa
+		return x + F.linear(u * F.silu(v), w_out)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.r_layer = config.r_layer
+		self.n_layer = config.n_layer
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		self.retain = RetentionMechanism(config)
+		# low rank qkvo and layer weights
+		self.lr_qkvo = CastedLinear(config.n_embd // 4, 5*config.n_qkv + config.n_embd)
+		self.lr_layers = CastedLinear(config.n_embd // 4, config.n_layer * config.n_embd)
+
+		# attention layers
 		self.aft = AttentionFreeTransformer()
 		self.tea = TheExpertAbundance(config)
-		self.swiglu = Swiglu()
 
 	def forward(self, x, cos_sin):
-		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-		w = self.retain.w_qkvo.weight
-		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
+		w_qkvo = self.lr_layers(self.lr_qkvo.weight).chunk(self.n_layer, dim=-1)
 
-		for i in range(self.r_layer):
-			# 3 consecutive global-context linear attention, 1 local-context scaled dot product attention
-			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
-			x, oa = self.swiglu(x, y, w_swiglu, w_out)
+		for i, w in enumerate(w_qkvo):
+			# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+			w_qkv, w_swiglu, w_out = torch.split(w, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+			w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
+			w = (w_qkv, w_swiglu, w_out)
 
-			# retention update rule to update qkvo params
-			w = self.retain(w, oa)
-			w_qkv, w_swiglu, w_out = self.retain.w_split(w)
-			w_qkv 	 = norm(w_qkv)
-			w_swiglu = norm(w_swiglu)
-			w_out 	 = norm(w_out)
+			# 3 consecutive global-context linear attention,
+			# 1 local-context scaled dot product attention
+			for _ in range(2):
+				x = self.tea(x, cos_sin, w) if (i+1) % 4 == 0 else self.aft(x, w)
 
-		# one final local-context spda & swiglu ffn
-		x, y = self.tea(x, cos_sin, w_qkv)
-		return self.swiglu(x, y, w_swiglu, w_out, oa=False)
+		return x
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
@@ -195,7 +148,7 @@ class Strawberry(nn.Module):
 
 		# factorized token embeddings
 		self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-		self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+		self.block = Block(config)
 		self.unembed = CastedLinear(config.n_embd, config.vocab_size)
 		self.embed.weight = self.unembed.weight
 
@@ -229,8 +182,8 @@ class Strawberry(nn.Module):
 		x = self.embed(idx)
 		x = norm(x)
 
-		for block in self.blocks:
-			x = block(x, cos_sin)
+		# pass the input into the main block
+		x = self.block(x, cos_sin)
 
 		# forward the lm_head (compute logits)
 		x = norm(x)
