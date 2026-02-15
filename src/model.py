@@ -55,23 +55,6 @@ class RetentionMechanism(nn.Module):
 		self.w_qkvo = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
 
 	# update rule for retention of weights.
-	# def forward(self, w, oa):
-	# 	w = w + F.silu(w) * (w @ oa)
-
-	# 	# normalize here (fixes initial scale)
-	# 	target_std = self.n_embd ** -0.5
-	# 	return w * (target_std / (w.std() + 1e-8))
-
-	# # update rule for retention of weights.
-	# def forward(self, wC, oa):
-	# 	wT = wC @ oa
-	# 	w = wC * F.silu(wT) + wC
-
-	# 	# normalize here (fixes initial scale)
-	# 	target_std = self.n_embd ** -0.5
-	# 	return w * (target_std / (w.std() + 1e-8))
-
-	# update rule for retention of weights.
 	# wc -> current weights; wt -> transform weights
 	def forward(self, wC, oa):
 		# transform OA weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
@@ -155,13 +138,12 @@ class Swiglu(nn.Module):
 
 		# output projection
 		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
-		y = x + F.linear(u * F.sigmoid(v), w_out)
+		y = x + F.linear(u * F.silu(v), w_out)
 
 		if not oa:
 			return y
 
 		# (B, T, C) -> (B*T, C) -> (C, C)
-		# oa = F.silu(norm(u.view(B*T, -1)).T) @ norm(v.view(B*T, -1))
 		# use UV vals for orignal & adjust values
 		o, a = u.view(B*T, -1), v.view(B*T, -1)
 		o, a = norm(o), (a)
@@ -193,7 +175,7 @@ class Block(nn.Module):
 			x, oa = self.swiglu(x, y, w_swiglu, w_out)
 
 			# retention update rule to update qkvo params
-			w = self.retain(w, oa)
+			w = 2 * self.retain(w, oa)
 
 		# split `w` into, w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
 		w_qkv, w_swiglu, w_out = self.retain.w_split(w)
