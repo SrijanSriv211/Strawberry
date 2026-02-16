@@ -28,7 +28,8 @@ CONFIG = json.loads(open(sys.argv[1], "r", encoding="utf-8").read()) if len(sys.
 	"model_hyperparams": {
 		"vocab_size": 8192,
 		"block_size": 256,
-		"n_layer": 4,
+		"r_layer": 2,
+		"n_layer": 2,
 		"n_head": 4,
 		"n_embd": 64,
 		"n_qkv": 256
@@ -107,7 +108,7 @@ model.to(device)
 optimizer_hyperparams = CONFIG["optimizer_hyperparams"] if checkpoint is None else checkpoint["optimizer_hyperparams"]
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.block.named_parameters() if p.ndim >= 2 and "embed" not in n]
+hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
 embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 adam_params = embed_params
 
@@ -234,7 +235,7 @@ print0(
 # report number of parameters
 print0(
 	f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.parameters())/1e6}M", "parameters,",
-	f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.block.parameters())/1e6}M", "non-embedding parameters",
+	f"{Fore.WHITE}{Style.BRIGHT}{sum(p.numel() for p in model.blocks.parameters())/1e6}M", "non-embedding parameters",
 	log_path=log_path
 )
 
