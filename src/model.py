@@ -1,15 +1,19 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch
+import torch.nn as nn, torch, math
 
 @dataclass
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
 	n_layer: int = 2 # new layers
+	r_layer: int = 2 # reuse layers
 	n_head: int = 4
 	n_embd: int = 64
 	n_qkv: int = 256
+	n_ffn: int = 256
+	n_experts: int = 4 # total experts
+	a_experts: int = 2 # active experts
 
 def norm(x):
 	return F.rms_norm(x, (x.size(-1),))
@@ -42,13 +46,72 @@ class CastedLinear(nn.Module):
 	def forward(self, x):
 		return F.linear(x, self.weight)
 
+class RetentionMechanism(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.n_embd = config.n_embd
+		self.n_qkv = config.n_qkv
+
+		# merged OAT weights
+		self.oa = CastedLinear(config.n_embd, 2*config.n_embd)
+		self.t = CastedLinear(config.n_embd, 5*config.n_qkv + config.n_embd)
+
+		# merged QKV weights & out proj weights
+		# fixed/pre-trained attention qkv, swiglu and out weights
+		# w_attn_qkv shape: (C, 3*D); w_attn_swiglu shape: (D, 2*C); w_attn_out shape: (C, C)
+		self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out = torch.split(self.t.weight, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+		self.w_attn_swiglu = self.w_attn_swiglu.reshape(2*self.n_embd, self.n_qkv)
+
+	# normalize here (fixes initial scale)
+	def w_norm(self, w, n):
+		target_std = n ** -0.5
+		return w * (target_std / (w.std() + 1e-8))
+
+	# return the new "old" & "current" weights.
+	def forward(self, wt, wc):
+		# update QKV, Swiglu and output projection weights
+		w_qkv 	 = wt[0] * F.silu(wc[0]) + wc[0]
+		w_swiglu = wt[1] * F.silu(wc[1]) + wc[1]
+		w_out 	 = wt[2] * F.silu(wc[2]) + wc[2]
+
+		# normalize QKV, Swiglu and output projection weights
+		w_qkv 	 = self.w_norm(w_qkv, self.n_embd)
+		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
+		w_out 	 = self.w_norm(w_out, self.n_embd)
+
+		return wc, (w_qkv, w_swiglu, w_out)
+
+	def produce(self, x):
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, C = x.size()
+
+		# calculate orignal & adjust values
+		o, a = self.oa(norm(x)).view(B*T, -1).chunk(2, dim=-1) # (B*T, C)
+		o, a = norm(o), norm(a)
+
+		# compact O & A of shape (B*T, C) -> (C, C) shape
+		scale_factor = 1 / math.sqrt(C)
+		y = o.T @ a * scale_factor
+		y = F.softmax(y, dim=-1)
+
+		# transform weights from (C, C) -> (5*D+C, C), where C = n_embd; D = n_qkv
+		y = self.t.weight @ y
+
+		# normalize here (fixes initial scale)
+		y = self.w_norm(y, 5 * self.n_qkv + self.n_embd)
+
+		# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
+		w_qkv, w_swiglu, w_out = torch.split(y, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
+		w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
+
+		return (self.w_attn_qkv, self.w_attn_swiglu, self.w_attn_out), (w_qkv, w_swiglu, w_out)
+
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
 	def __init__(self):
 		super().__init__()
 
 	def forward(self, x, w):
-		# retention mechanism produced qkv, swiglu & out proj weights
 		w_qkv, w_swiglu, w_out = w
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -108,36 +171,79 @@ class TheExpertAbundance(nn.Module):
 		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
 		return x + F.linear(u * F.silu(v), w_out)
 
+class Swiglu(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.swiglu = CastedLinear(config.n_embd, config.n_ffn*2)
+		self.out = CastedLinear(config.n_ffn, config.n_embd)
+
+	def forward(self, x):
+		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
+		return x + self.out(u * F.silu(v))
+
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.n_layer = config.n_layer
+		self.r_layer = config.r_layer
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		# low rank qkvo and layer weights
-		self.lr_qkvo = CastedLinear(config.n_embd // 4, 5*config.n_qkv + config.n_embd)
-		self.lr_layers = CastedLinear(config.n_embd // 4, config.n_layer * config.n_embd)
-
-		# attention layers
+		self.retain = RetentionMechanism(config)
 		self.aft = AttentionFreeTransformer()
 		self.tea = TheExpertAbundance(config)
+		self.swiglu = Swiglu(config)
+
+	def check(self, i, w, w_prev, w_initial):
+		with torch.no_grad():
+			diff_norm = (w - w_prev).norm()
+			w_norm = w_prev.norm()
+			rel_change = (diff_norm / (w_norm + 1e-8)).item()
+
+			cos_sim = F.cosine_similarity(
+				w_prev.contiguous().view(1, -1),
+				w.contiguous().view(1, -1),
+				dim=-1
+			).item()
+
+			cos_sim_init = F.cosine_similarity(
+				w_initial.contiguous().view(1, -1),
+				w.contiguous().view(1, -1),
+				dim=-1
+			).item()
+
+			# largest singular value
+			try:
+				s_max = torch.linalg.svdvals(w)[0].item()
+			except:
+				s_max = float("nan")
+
+			print(
+				f"[Retention {i}] "
+				f"rel_change={rel_change:.6f} | "
+				f"cos(prev)={cos_sim:.6f} | "
+				f"cos(init)={cos_sim_init:.6f} | "
+				f"s_max={s_max:.4f}"
+			)
+
+	def cat(self, w_qkv, w_swiglu, w_out):
+		w_swiglu = w_swiglu.reshape(2*self.n_qkv, self.n_embd)
+		return torch.cat([w_qkv, w_swiglu, w_out], dim=0)
 
 	def forward(self, x, cos_sin):
-		w_qkvo = self.lr_layers(self.lr_qkvo.weight).chunk(self.n_layer, dim=-1)
+		# wc -> current weights; wt -> transform weights
+		wc, wt = self.retain.produce(x)
+		wc_init = self.cat(*wc).clone()
 
-		for i, w in enumerate(w_qkvo):
-			# w_qkv shape: (C, 3*D); w_swiglu shape: (D, 2*C); w_out shape: (C, C)
-			w_qkv, w_swiglu, w_out = torch.split(w, [3*self.n_qkv, 2*self.n_qkv, self.n_embd], dim=0)
-			w_swiglu = w_swiglu.reshape(2*self.n_embd, self.n_qkv)
-			w = (w_qkv, w_swiglu, w_out)
+		# after 3 every consecutive global-linear attentions, apply 1 local-scaled-dot-product attention
+		for i in range(self.r_layer):
+			x = self.tea(x, cos_sin, wc) if (i + 1) % 4 == 0 else self.aft(x, wc)
+			wc_prev = self.cat(*wc).clone()
+			wt, wc = self.retain(wt, wc)
+			self.check(i, self.cat(*wc), wc_prev, wc_init)
 
-			# 3 consecutive global-context linear attention,
-			# 1 local-context scaled dot product attention
-			for _ in range(2):
-				x = self.tea(x, cos_sin, w) if (i+1) % 4 == 0 else self.aft(x, w)
-
-		return x
+		print("-"*70)
+		x = self.tea(x, cos_sin, wc)
+		return self.swiglu(x)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
@@ -148,7 +254,7 @@ class Strawberry(nn.Module):
 
 		# factorized token embeddings
 		self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-		self.block = Block(config)
+		self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
 		self.unembed = CastedLinear(config.n_embd, config.vocab_size)
 		self.embed.weight = self.unembed.weight
 
@@ -182,8 +288,8 @@ class Strawberry(nn.Module):
 		x = self.embed(idx)
 		x = norm(x)
 
-		# pass the input into the main block
-		x = self.block(x, cos_sin)
+		for block in self.blocks:
+			x = block(x, cos_sin)
 
 		# forward the lm_head (compute logits)
 		x = norm(x)
