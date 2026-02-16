@@ -11,7 +11,8 @@ Strawberry brings several improvements over the standard GPT-2 architecture, suc
 4. Swiglu based FFN [[paper](https://arxiv.org/pdf/2002.05202)]
 5. Modernized architecture: Rotary embeddings and QK-Norm
 6. My custom `The Expert Abundance` attention mechanism
-7. Shared embedding weights
+7. My custom `Retention Mechanism` architecture
+8. Shared embedding weights
 
 ## The Expert Abundance
 MoE-attention mechanism & Swiglu mini-FFN.
@@ -27,6 +28,46 @@ Y           -> X + out(Y)                                                       
 
 > [!NOTE]
 > As of now Token-level Local-Context-MoE has not been implemented in The Expert Abundance.
+
+## Retention Mechanism
+Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
+
+### How it works
+1. Produce
+- Has 3 trainable linear layers. Original (`w_O`), adjust (`w_A`) & transform weights (`w_T`).
+- Original weights acts similar to Query weights in attention mechanism, it tells the model about the information original input (`X`) had.
+- Adjust weights tell the model how to adjust the information presented by `Xw_O`.
+- Transform weights tell the model to transform the adjusted information in a way which can be used by attention and mini-swiglu in attention.
+- Original & Adjust weights shares the same shape `(C, C)`; where `C` is embedding dimension of the model.
+- Transform weights has a shape `(C, 5*D + C)`; where `D` is QKV dimension.
+- `(C, 5*D+C)` can be splitted into 3 weights; **w_qkv shape**: `(C, 3*D)`, **w_swiglu shape**: `(D, 2*C)` & **w_out shape**: `(C, C)`
+
+2. Initialization
+- We have **w_attn_qkv**, **w_attn_swiglu** & **w_attn_out**. QKV, Swiglu & out proj parameters of the attention mechanism.
+- We also have **w_qkv**, **w_swiglu** & **w_out**. QKV, Swiglu & out proj parameters derived from the retention mechanism.
+- We create 2 variables Current (`wC`) & Transformed (`wT`).
+- Then we set them as the following `wC = tuple(w_attn_qkv, w_attn_swiglu, w_attn_out)` & `wT = tuple(w_qkv, w_swiglu, w_out)`.
+
+3. Update rule
+- First we always perform attention on `wC`.
+- Then we update `wC` & `wT` in way given below:
+
+```python
+# update QKV, Swiglu and output projection weights
+w_qkv 	 = wT[0] * F.silu(wC[0]) + wC[0]
+w_swiglu = wT[1] * F.silu(wC[1]) + wC[1]
+w_out 	 = wT[2] * F.silu(wC[2]) + wC[2]
+
+# normalize QKV, Swiglu and output projection weights
+w_qkv 	 = self.w_norm(w_qkv, self.n_embd)
+w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
+w_out 	 = self.w_norm(w_out, self.n_embd)
+
+# swap
+wT, wC = wC, (w_qkv, w_swiglu, w_out)
+```
+
+- Then we again perform the attention on new `wC` and this cycle continues.
 
 ## Getting Started
 <ins>**1. Downloading the repository:**</ins>
