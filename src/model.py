@@ -233,14 +233,22 @@ class Block(nn.Module):
 		# wc -> current weights; wt -> transform weights
 		wc, wt = self.retain.produce(x)
 		wc_init = self.cat(*wc).clone()
+		wt_init = self.cat(*wt).clone()
+		self.check(-1, wt_init, wc_init, wc_init)
 
 		# after 3 every consecutive global-linear attentions, apply 1 local-scaled-dot-product attention
 		for i in range(self.r_layer):
 			x = self.tea(x, cos_sin, wc) if (i + 1) % 4 == 0 else self.aft(x, wc)
 			wc_prev = self.cat(*wc).clone()
+			wt_prev = self.cat(*wt).clone()
 			wt, wc = self.retain(wt, wc)
+			self.check(i, wc_prev, wt_prev, wt_init)
+			self.check(i, wt_prev, wc_prev, wc_init)
+			self.check(i, self.cat(*wt), wc_prev, wc_init)
+			self.check(i, self.cat(*wc), wt_prev, wt_init)
+			self.check(i, self.cat(*wt), wt_prev, wt_init)
 			self.check(i, self.cat(*wc), wc_prev, wc_init)
-
+			print("*"*70)
 		print("-"*70)
 		x = self.tea(x, cos_sin, wc)
 		return self.swiglu(x)
