@@ -67,39 +67,46 @@ class RetentionMechanism(nn.Module):
 		return w * (target_std / (w.std() + 1e-8))
 
 	# return the new "old" & "current" weights.
-	def forward(self, x, w, update=True):
+	def forward(self, x, y, w, update=True):
 		# retention mechanism produced qkv, swiglu & out proj weights
 		w_qkv, w_swiglu, w_out = w
 
 		# swiglu ffn calculation
-		u, v = F.linear(x, w_swiglu).chunk(2, dim=-1)
-		x = x + F.linear(u * F.silu(v), w_out)
+		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
+		y = x + F.linear(u * F.silu(v), w_out)
 
 		if not update:
-			return x
+			return y
 
 		# calculate orignal & adjust values
 		# compact O & A of shape (B, T, C) -> (B, C, C) -> (C, C) shape
-		oa = (u.T @ v).mean(dim=0)
+		oa = (u.transpose(1, 2) @ v).mean(dim=0)
 		oa = norm(oa)
 
-		# update QKV, swiglu and output projection weights
-		new_w_qkv = w_qkv @ oa
-		new_w_qkv = F.silu(new_w_qkv)
-		w_qkv = w_qkv + self.out(new_w_qkv)
-		w_qkv = norm(w_qkv)
+		# update qkv weights
+		nw_qkv = w_qkv @ oa
+		nw_qkv = F.silu(nw_qkv)
+		w_qkv = w_qkv + self.out(nw_qkv)
+		w_qkv = self.w_norm(w_qkv, self.n_embd)
 
-		new_w_swiglu = w_swiglu @ oa
-		new_w_swiglu = F.silu(new_w_swiglu)
-		w_swiglu = w_swiglu + self.out(new_w_swiglu.view(self.n_embd, 2*self.n_qkv).T).T
-		w_swiglu = norm(w_swiglu)
+		# update swiglu weights
+		nw_swiglu = w_swiglu.view(self.n_embd, 2*self.n_qkv).T
 
-		new_w_out = w_out @ oa
-		new_w_out = F.silu(new_w_out)
-		w_qkv = w_out + self.out(new_w_out)
-		w_qkv = norm(w_out)
+		nw_swiglu = nw_swiglu @ oa
+		nw_swiglu = F.silu(nw_swiglu)
+		nw_swiglu = self.out(nw_swiglu)
 
-		return x, (w_qkv, w_swiglu, w_out)
+		nw_swiglu = nw_swiglu.T.contiguous().view(2*self.n_embd, self.n_qkv)
+		w_swiglu = w_swiglu + nw_swiglu
+		w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
+
+		# update out weights
+		nw_out = w_out @ oa
+		nw_out = F.silu(nw_out)
+		w_out = w_out + self.out(nw_out)
+		w_out = self.w_norm(w_out, self.n_qkv)
+
+		return y, (w_qkv, w_swiglu, w_out)
 
 # calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 class AttentionFreeTransformer(nn.Module):
@@ -123,7 +130,7 @@ class AttentionFreeTransformer(nn.Module):
 		y = kv / (w + 1e-6)
 
 		# gate with query
-		return F.sigmoid(q) * y
+		return x, F.sigmoid(q) * y
 
 # new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
@@ -151,7 +158,7 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		return y.transpose(1, 2).contiguous().view(B, T, -1)
+		return x, y.transpose(1, 2).contiguous().view(B, T, -1)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
@@ -203,18 +210,30 @@ class Block(nn.Module):
 	def forward(self, x, cos_sin):
 		w_qkv, w_swiglu, w_out = self.retention.w_attn_qkv, self.retention.w_attn_swiglu, self.retention.w_attn_out
 		w_init = self.cat(w_qkv, w_swiglu, w_out).clone()
+		w_qkv_init = w_qkv.clone()
+		w_swiglu_init = w_swiglu.clone()
+		w_out_init = w_out.clone()
 
 		# 3 consecutive global-linear attentions,
 		# then 1 local-scaled-dot-product attention
 		for i in range(self.r_layer):
-			x = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
+			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
 			w_prev = self.cat(w_qkv, w_swiglu, w_out).clone()
-			x, w = self.retention(x, (w_qkv, w_swiglu, w_out))
-			w_qkv, w_swiglu, w_out = w
-			self.check(i, self.cat(*w), w_prev, w_init)
+			w_qkv_prev = w_qkv.clone()
+			w_swiglu_prev = w_swiglu.clone()
+			w_out_prev = w_out.clone()
 
-		x = self.tea(x, cos_sin, w_qkv)
-		return self.retention(x, (w_qkv, w_swiglu, w_out), False)
+			x, w = self.retention(x, y, (w_qkv, w_swiglu, w_out))
+			w_qkv, w_swiglu, w_out = w
+
+			self.check(i, w_qkv, w_qkv_prev, w_qkv_init)
+			self.check(i, w_swiglu, w_swiglu_prev, w_swiglu_init)
+			self.check(i, w_out, w_out_prev, w_out_init)
+			self.check(i, self.cat(w_qkv, w_swiglu, w_out), w_prev, w_init)
+			print("-"*70)
+		print("*"*70)
+		x, y = self.tea(x, cos_sin, w_qkv)
+		return self.retention(x, y, (w_qkv, w_swiglu, w_out), False)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
