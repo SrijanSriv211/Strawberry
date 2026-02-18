@@ -6,13 +6,14 @@ Strawberry is primarily an early-stage neural network architecture built on top 
 
 Strawberry brings several improvements over the standard GPT-2 architecture, such as:
 1. Shared stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
-2. MoE Swiglu FFN & attention mechanism [[paper](https://arxiv.org/pdf/1701.06538)]
-3. Apple's Attention Free Transformer [[paper](https://arxiv.org/pdf/2105.14103)]
-4. Swiglu based FFN [[paper](https://arxiv.org/pdf/2002.05202)]
-5. Modernized architecture: Rotary embeddings and QK-Norm
-6. My custom `The Expert Abundance` attention mechanism
-7. My custom `Retention Mechanism` architecture
-8. Shared embedding weights
+2. `N:1` ratio attention placement inspired from Kimi Linear [paper](https://arxiv.org/pdf/2510.26692)
+3. MoE Swiglu FFN & attention mechanism [[paper](https://arxiv.org/pdf/1701.06538)]
+4. Apple's Attention Free Transformer [[paper](https://arxiv.org/pdf/2105.14103)]
+5. Swiglu based FFN [[paper](https://arxiv.org/pdf/2002.05202)]
+6. Modernized architecture: Rotary embeddings and QK-Norm
+7. My custom `The Expert Abundance` attention mechanism
+8. My custom `Retention Mechanism` architecture
+9. Shared embedding weights
 
 ## The Expert Abundance
 MoE-attention mechanism & Swiglu mini-FFN.
@@ -20,54 +21,92 @@ MoE-attention mechanism & Swiglu mini-FFN.
 - Derive **QKV**, **Swiglu** & **Output projection** weights by the Retention Mechanism's **Update Rule** *(given below)*
 
 ```
-Q, K, V     -> Token-level Local-Context-MoE Scaled Dot Product Attention		-> Y
-Y           -> Concatenate all local mixture of attention parts                 -> Y
-Y           -> Swiglu mini-ffn                                                  -> Y
-Y           -> X + out(Y)                                                       -> Y
+X, Q, K, V  -> Token-level Local-Context-MoE Scaled Dot Product Attention		-> Y
+Y           -> Concatenate all local mixture of attention parts                 -> X, Y
 ```
 
 > [!NOTE]
 > As of now Token-level Local-Context-MoE has not been implemented in The Expert Abundance.
 
 ## Retention Mechanism
-Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
+1. Derive **QKV**, **Swiglu** & **out projection** weights using the given input.
+2. Replacing the standard FFN layer, the **Retention** and is placed after the **Attention** layer.
+3. The retention layer first performs the same computation as a regular Swiglu FFN, then continues to generate new **QKVO** weights using those computations.
 
-### How it works
-1. Produce
-- Has 3 trainable linear layers. Original (`w_O`), adjust (`w_A`) & transform weights (`w_T`).
-- Original weights acts similar to Query weights in attention mechanism, it tells the model about the information original input (`X`) had.
-- Adjust weights tell the model how to adjust the information presented by `Xw_O`.
-- Transform weights tell the model to transform the adjusted information in a way which can be used by attention and mini-swiglu in attention.
-- Original & Adjust weights shares the same shape `(C, C)`; where `C` is embedding dimension of the model.
-- Transform weights has a shape `(C, 5*D + C)`; where `D` is QKV dimension.
-- `(C, 5*D+C)` can be splitted into 3 weights; **w_qkv shape**: `(C, 3*D)`, **w_swiglu shape**: `(D, 2*C)` & **w_out shape**: `(C, C)`
+### Base Weights
+Each block contains 5 learned tensors.
+- `w_attn_qkv` 		-> shape `(C, 3D)`
+- `w_attn_swiglu` 	-> shape `(2C, D)`
+- `w_attn_out` 		-> shape `(C, C)`
+- `out` 			-> shape `(C, C)`
+- `tao` 			-> shape `(1, 3)`
 
-2. Initialization
-- We have **w_attn_qkv**, **w_attn_swiglu** & **w_attn_out**. QKV, Swiglu & out proj parameters of the attention mechanism.
-- We also have **w_qkv**, **w_swiglu** & **w_out**. QKV, Swiglu & out proj parameters derived from the retention mechanism.
-- We create 2 variables Current (`wC`) & Transformed (`wT`).
-- Then we set them as the following `wC = tuple(w_attn_qkv, w_attn_swiglu, w_attn_out)` & `wT = tuple(w_qkv, w_swiglu, w_out)`.
+where
+- `C` = embedding dimension (`n_embd`)
+- `D` = QKV dimension (`n_qkv`)
 
-3. Update rule
-- First we always perform attention on `wC`.
-- Then we update `wC` & `wT` in way given below:
+`w_attn_...` act as initial attention, swiglu & swiglu_out projection weights
 
-```python
-# update QKV, Swiglu and output projection weights
-w_qkv 	 = wT[0] * F.silu(wC[0]) + wC[0]
-w_swiglu = wT[1] * F.silu(wC[1]) + wC[1]
-w_out 	 = wT[2] * F.silu(wC[2]) + wC[2]
+We initialize these weights in following way:
+- `w_qkv = w_attn_qkv`
+- `w_swiglu = w_attn_swiglu`
+- `w_out = w_attn_out`
 
-# normalize QKV, Swiglu and output projection weights
-w_qkv 	 = self.w_norm(w_qkv, self.n_embd)
-w_swiglu = self.w_norm(w_swiglu, self.n_qkv)
-w_out 	 = self.w_norm(w_out, self.n_embd)
+`w_qkv`, `w_swiglu` and `w_out` are updated iteratively `r_layer` number of times.
 
-# swap
-wT, wC = wC, (w_qkv, w_swiglu, w_out)
+### Architecture Design
+For each retention step:
+```
+x, y = Attention(x, w_qkv)
+x, (w_qkv, w_swiglu, w_out) = Retention(x, y, (w_qkv, w_swiglu, w_out))
 ```
 
-- Then we again perform the attention on new `wC` and this cycle continues.
+- `Attention` alternates between `AttentionFreeTransformer` and `TheExpertAbundance`.
+- **Attention Free Transformer** (global-context linear attention) is applied 3 consecutive times.
+- **The Expert Abundance** (local-context-sliding-window scaled-dot-product attention) is then applied once.
+- Giving `3:1` AFT-to-TEA ratio. This design is inspired by **Kimi Linear's** `N:1` KDA-to-MLA ratio.
+- After `r_layer` updates, one final pass applies the **The Expert Abundance** attention mechanism & **Retention Mechanism** without further weight modification.
+
+### Swiglu FFN
+The **Swiglu FFN** is built into the Retention Mechanism as it's outputs are used as a basis for weights updates.
+
+Given attention input & output `x` & `y` respectively:
+```
+u, v = y @ w_swiglu
+y = x + (u * silu(v)) @ w_out.T
+```
+
+### Calculate orignal-adjust value
+Use `u` & `v` to create a compact `(C, C)` shaped input-dependent tensor
+- `u` act similar to Query weights in attention mechanism.
+- `v` tell the model how to adjust the information presented by `u`.
+- It is then used to calculate the **orignal-adjust** value.
+
+It happens in the following way:
+- `u` & `v` share the same shape `(B, T, C)`.
+- `u.transpose(1, 2) @ v` produces the **oa** tensor of shape `(B, C, C)`.
+- `mean(dim=0)` averages across batch, and produces a tensor of shape `C, C`.
+- `RMSnorm` is applied to normalize the newly generated **oa** tensor.
+
+### Update Rule
+`w_qkv` and `w_out` are updated in the following way:
+```
+n = w @ oa
+n = F.silu(n)
+w = w + out(n)
+w = norm(w, C) * tao
+```
+
+`w_swiglu` is updated in the following way:
+```
+n = w.view(C, 2*D).T @ oa
+n = F.silu(n)
+n = out(n)
+w = w + n.T.contiguous().view(2*C, D)
+w = norm(w, D) * tao
+```
+
+After this `y` from Swiglu FFN & `(w_qkv, w_swiglu, w_out)` are returned
 
 ## Getting Started
 <ins>**1. Downloading the repository:**</ins>
