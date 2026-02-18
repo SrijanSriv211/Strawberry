@@ -82,35 +82,30 @@ class RetentionMechanism(nn.Module):
 			return y
 
 		# split the tao values into 3, alpha, beta & gamma
-		tao = torch.abs(self.tao)
-		alpha, beta, gamma = tao[0], tao[1], tao[2]
+		alpha, beta, gamma = torch.abs(self.tao).clamp(1e-8, 1)
 
-		# calculate orignal & adjust values
+		# calculate adjusted-original value
 		# compact O & A of shape (B, T, C) -> (B, C, C) -> (C, C) shape
-		oa = (u.transpose(1, 2) @ v).mean(dim=0)
-		oa = norm(oa)
+		ao = (u.transpose(1, 2) @ v).mean(dim=0) * (self.n_embd ** -0.5)
+		ao = norm(ao)
 
 		# update qkv weights
-		nw_qkv = w_qkv @ oa
-		nw_qkv = F.silu(nw_qkv)
-		w_qkv = w_qkv + self.out(nw_qkv)
+		n = w_qkv @ ao
+		n = F.silu(n)
+		w_qkv = w_qkv + self.out(n)
 		w_qkv = self.w_norm(w_qkv, self.n_embd) * alpha
 
 		# update swiglu weights
-		nw_swiglu = w_swiglu.view(self.n_embd, 2*self.n_qkv).T
-
-		nw_swiglu = nw_swiglu @ oa
-		nw_swiglu = F.silu(nw_swiglu)
-		nw_swiglu = self.out(nw_swiglu)
-
-		nw_swiglu = nw_swiglu.T.contiguous().view(2*self.n_embd, self.n_qkv)
-		w_swiglu = w_swiglu + nw_swiglu
+		n = w_swiglu.view(self.n_embd, 2*self.n_qkv).T @ ao
+		n = F.silu(n)
+		n = self.out(n)
+		w_swiglu = w_swiglu + n.T.contiguous().view(2*self.n_embd, self.n_qkv)
 		w_swiglu = self.w_norm(w_swiglu, self.n_qkv) * beta
 
 		# update out weights
-		nw_out = w_out @ oa
-		nw_out = F.silu(nw_out)
-		w_out = w_out + self.out(nw_out)
+		n = w_out @ ao
+		n = F.silu(n)
+		w_out = w_out + self.out(n)
 		w_out = self.w_norm(w_out, self.n_qkv) * gamma
 
 		return y, (w_qkv, w_swiglu, w_out)
@@ -216,29 +211,15 @@ class Block(nn.Module):
 
 	def forward(self, x, cos_sin):
 		w_qkv, w_swiglu, w_out = self.retention.w_attn_qkv, self.retention.w_attn_swiglu, self.retention.w_attn_out
-		# w_init = self.cat(w_qkv, w_swiglu, w_out).clone()
-		# w_qkv_init = w_qkv.clone()
-		# w_swiglu_init = w_swiglu.clone()
-		# w_out_init = w_out.clone()
 
 		# 3 consecutive global-linear attentions,
 		# then 1 local-scaled-dot-product attention
 		for i in range(self.r_layer):
 			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
-			# w_prev = self.cat(w_qkv, w_swiglu, w_out).clone()
-			# w_qkv_prev = w_qkv.clone()
-			# w_swiglu_prev = w_swiglu.clone()
-			# w_out_prev = w_out.clone()
-
 			x, w = self.retention(x, y, (w_qkv, w_swiglu, w_out))
 			w_qkv, w_swiglu, w_out = w
 
-		# 	self.check(i, w_qkv, w_qkv_prev, w_qkv_init)
-		# 	self.check(i, w_swiglu, w_swiglu_prev, w_swiglu_init)
-		# 	self.check(i, w_out, w_out_prev, w_out_init)
-		# 	self.check(i, self.cat(w_qkv, w_swiglu, w_out), w_prev, w_init)
-		# 	print("-"*70)
-		# print("*"*70)
+		# one final TEA forward pass
 		x, y = self.tea(x, cos_sin, w_qkv)
 		return self.retention(x, y, (w_qkv, w_swiglu, w_out), False)
 
