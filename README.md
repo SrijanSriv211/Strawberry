@@ -85,7 +85,7 @@ Use `u` & `v` to create a compact `(C, C)` shaped input-dependent tensor
 It happens in the following way:
 - `u` & `v` share the same shape `(B, T, C)`.
 - `u.transpose(1, 2) @ v` produces the **oa** tensor of shape `(B, C, C)`.
-- `mean(dim=0)` averages across batch, and produces a tensor of shape `C, C`.
+- `mean(dim=0)` averages across batch, and produces a tensor of shape `(C, C)`.
 - `RMSnorm` is applied to normalize the newly generated **oa** tensor.
 
 ### Update Rule
