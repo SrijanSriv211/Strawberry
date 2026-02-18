@@ -6,7 +6,7 @@ Strawberry is primarily an early-stage neural network architecture built on top 
 
 Strawberry brings several improvements over the standard GPT-2 architecture, such as:
 1. Shared stack of layers across recursion steps inspired from Google's Mixture of Recursions [[paper](https://arxiv.org/pdf/2507.10524)]
-2. `N:1` ratio attention placement inspired from Kimi Linear [paper](https://arxiv.org/pdf/2510.26692)
+2. `N:1` ratio attention placement inspired from Kimi Linear [[paper](https://arxiv.org/pdf/2510.26692)]
 3. MoE Swiglu FFN & attention mechanism [[paper](https://arxiv.org/pdf/1701.06538)]
 4. Apple's Attention Free Transformer [[paper](https://arxiv.org/pdf/2105.14103)]
 5. Swiglu based FFN [[paper](https://arxiv.org/pdf/2002.05202)]
@@ -62,8 +62,8 @@ x, (w_qkv, w_swiglu, w_out) = Retention(x, y, (w_qkv, w_swiglu, w_out))
 ```
 
 - `Attention` alternates between `AttentionFreeTransformer` and `TheExpertAbundance`.
-- **Attention Free Transformer** (global-context linear attention) is applied 3 consecutive times.
-- **The Expert Abundance** (local-context-sliding-window scaled-dot-product attention) is then applied once.
+- **Attention Free Transformer** (global-context linear attention) is applied for 3 steps.
+- **The Expert Abundance** (local-context-sliding-window scaled-dot-product attention) is then applied in every 4th step.
 - Giving `3:1` AFT-to-TEA ratio. This design is inspired by **Kimi Linear's** `N:1` KDA-to-MLA ratio.
 - After `r_layer` updates, one final pass applies the **The Expert Abundance** attention mechanism & **Retention Mechanism** without further weight modification.
 
@@ -72,7 +72,7 @@ The **Swiglu FFN** is built into the Retention Mechanism as it's outputs are use
 
 Given attention input & output `x` & `y` respectively:
 ```
-u, v = y @ w_swiglu
+u, v = y @ w_swiglu.T
 y = x + (u * silu(v)) @ w_out.T
 ```
 
@@ -94,7 +94,7 @@ It happens in the following way:
 n = w @ oa
 n = F.silu(n)
 w = w + out(n)
-w = norm(w, C) * tao
+w = norm(w, C) * (alpha or gamma)
 ```
 
 `w_swiglu` is updated in the following way:
@@ -103,10 +103,12 @@ n = w.view(C, 2*D).T @ oa
 n = F.silu(n)
 n = out(n)
 w = w + n.T.contiguous().view(2*C, D)
-w = norm(w, D) * tao
+w = norm(w, D) * beta
 ```
 
-After this `y` from Swiglu FFN & `(w_qkv, w_swiglu, w_out)` are returned
+- `tao` is split into 3 learned positive-only scalars, `alpha`, `beta` & `gamma`.
+- `alpha`, `beta` & `gamma` are used in updating `w_qkv`, `w_swiglu` & `w_out` respectively.
+- After this `y` from Swiglu FFN & `(w_qkv, w_swiglu, w_out)` are returned
 
 ## Getting Started
 <ins>**1. Downloading the repository:**</ins>
@@ -132,11 +134,11 @@ The configuration object can be found in `train.py`, which can also be copy-past
 	"model_hyperparams": {
 		"vocab_size": 8192,
 		"block_size": 256,
-		"n_layer": 2, // number of layers you want
+		"r_layer": 2, // number of retention update steps
+		"n_layer": 2, // number of layers
 		"n_head": 4,
 		"n_embd": 64,
-		"n_qkv": 256,
-		"n_ffn": 256
+		"n_qkv": 256
 	},
 	"optimizer_hyperparams": {
 		"eps": 1e-10,
