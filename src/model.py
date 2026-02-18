@@ -173,42 +173,6 @@ class Block(nn.Module):
 		self.tea = TheExpertAbundance(config)
 		self.retention = RetentionMechanism(config)
 
-	def check(self, i, w, w_prev, w_initial):
-		with torch.no_grad():
-			diff_norm = (w - w_prev).norm()
-			w_norm = w_prev.norm()
-			rel_change = (diff_norm / (w_norm + 1e-8)).item()
-
-			cos_sim = F.cosine_similarity(
-				w_prev.contiguous().view(1, -1),
-				w.contiguous().view(1, -1),
-				dim=-1
-			).item()
-
-			cos_sim_init = F.cosine_similarity(
-				w_initial.contiguous().view(1, -1),
-				w.contiguous().view(1, -1),
-				dim=-1
-			).item()
-
-			# largest singular value
-			try:
-				s_max = torch.linalg.svdvals(w)[0].item()
-			except:
-				s_max = float("nan")
-
-			print(
-				f"[Retention {i}] "
-				f"rel_change={rel_change:.6f} | "
-				f"cos(prev)={cos_sim:.6f} | "
-				f"cos(init)={cos_sim_init:.6f} | "
-				f"s_max={s_max:.4f}"
-			)
-
-	def cat(self, w_qkv, w_swiglu, w_out):
-		w_swiglu = w_swiglu.reshape(2*self.n_qkv, self.n_embd)
-		return torch.cat([w_qkv, w_swiglu, w_out], dim=0)
-
 	def forward(self, x, cos_sin):
 		w_qkv, w_swiglu, w_out = self.retention.w_attn_qkv, self.retention.w_attn_swiglu, self.retention.w_attn_out
 
