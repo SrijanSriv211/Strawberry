@@ -51,24 +51,30 @@ class RetentionMechanism(nn.Module):
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		self.swiglu = CastedLinear(config.n_embd, (config.n_embd // 8)*2)
-		self.out = CastedLinear((config.n_embd // 8), config.n_embd)
+		self.lr_embd = config.n_embd // 8 # low-rank embedding size
+		self.swiglu = CastedLinear(config.n_embd, self.lr_embd*2)
+		self.out = CastedLinear(self.lr_embd, config.n_embd)
 
 	def forward(self, x):
 		# swiglu ffn calculation
 		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
 
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, C = u.size()
+
 		# update weights
-		y = u.transpose(2, 1) @ F.silu(v) * (u.size(-1) ** -0.5)
-		y = y.mean(dim=0).unsqueeze(0)
+		u, v = u.view(B*T, C), v.view(B*T, C)
+		y = u.T @ v
+		y = y * (B*T)**-0.5
+		y = y.unsqueeze(0)
 		ones = torch.ones(y.shape)
 
 		# norm b/w [-pi, pi]
-		m = torch.arange(1, (self.f_qkv * 4)/2).unsqueeze(1).unsqueeze(1)
+		m = torch.arange(1, (4 * self.f_qkv)/2).unsqueeze(1).unsqueeze(1)
 		pi = F.tanh(y * m) * 3.14
 
-		# [y, sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
-		y = torch.cat([ones, y, torch.sin(pi), torch.cos(pi)], dim=0)
+		# [sigmoid(y), sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
+		y = torch.cat([ones, F.sigmoid(y), torch.sin(pi), torch.cos(pi)], dim=0)
 
 		# `(C/8, C/8)` -> `(C, C)`
 		y = self.out(y).repeat_interleave(8, dim=1)
@@ -76,7 +82,10 @@ class RetentionMechanism(nn.Module):
 
 		# retention mechanism produced qkv & out proj
 		w_qkv, w_out = torch.split(y, [3*self.n_qkv, self.n_qkv], dim=0)
-		w_qkv, w_out = w_qkv * (self.n_embd ** -0.5), w_out.T * (self.n_qkv ** -0.5)
+
+		# normalize
+		w_qkv = F.normalize(w_qkv, dim=1) * self.n_embd**-0.5
+		w_out = F.normalize(w_out.T, dim=1) * self.n_qkv**-0.5
 		return w_qkv, w_out
 
 # new version of my AttentionOnDetail attention mechanism
@@ -88,7 +97,6 @@ class TheExpertAbundance(nn.Module):
 
 		self.qkv = CastedLinear(config.n_embd, config.n_qkv*3)
 		self.out = CastedLinear(config.n_qkv, config.n_embd)
-		self.tao = nn.Parameter(torch.tensor([-4.9]))
 
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 	def aft(self, qkv):
@@ -124,36 +132,45 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		return y.transpose(1, 2).contiguous().view(B, T, -1)
+		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+
+		# add non-linearity to avoid collapsing & improving expressivity
+		return F.silu(y)
 
 	def forward(self, x, cos_sin, w_qkv, w_out, i):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkv1 = self.qkv(norm(x))
-		attn1 = self.spda(B, T, qkv1, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv1)
-		out1 = self.out(attn1)
+		qkv = F.linear(norm(x), self.qkv.weight + w_qkv)
+		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
+		return x + F.linear(attn, self.out.weight + w_out)
 
-		qkv2 = F.linear(norm(x), w_qkv)
-		attn2 = self.spda(B, T, qkv2, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv2)
-		out2 = F.linear(attn2, w_out)
+class Swiglu(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.swiglu = CastedLinear(config.n_embd, 4*config.n_embd*2)
+		self.out = CastedLinear(4*config.n_embd, config.n_embd)
 
-		return x + out1 + out2 * F.sigmoid(self.tao)
+	def forward(self, x):
+		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
+		y = u * F.silu(v)
+		return self.out(y)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 		self.r_layer = config.r_layer
 
-		self.tea = TheExpertAbundance(config)
 		self.retention = RetentionMechanism(config)
+		self.tea = TheExpertAbundance(config)
+		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
 		for i in range(self.r_layer):
 			w_qkv, w_out = self.retention(x)
 			x = self.tea(x, cos_sin, w_qkv, w_out, i)
-		return x
+		return self.swiglu(x)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
