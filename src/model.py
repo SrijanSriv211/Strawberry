@@ -1,19 +1,16 @@
 from torch.nn import functional as F
 from dataclasses import dataclass
-import torch.nn as nn, torch, math
+import torch.nn as nn, torch
 
 @dataclass
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
-	n_layer: int = 2 # new layers
 	r_layer: int = 2 # reuse layers
+	n_layer: int = 2 # new layers
 	n_head: int = 4
 	n_embd: int = 64
 	n_qkv: int = 256
-	n_ffn: int = 256
-	n_experts: int = 4 # total experts
-	a_experts: int = 2 # active experts
 
 def norm(x):
 	return F.rms_norm(x, (x.size(-1),))
@@ -49,75 +46,51 @@ class CastedLinear(nn.Module):
 class RetentionMechanism(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
+		assert config.n_qkv % config.n_embd == 0
+		self.f_qkv = config.n_qkv // config.n_embd
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		# merged QKV weights & out proj weights
-		# fixed/pre-trained attention qkv, swiglu and out weights
-		self.w_attn_qkv = CastedLinear(config.n_embd, config.n_qkv*3).weight
-		self.w_attn_swiglu = CastedLinear(config.n_qkv, config.n_embd*2).weight
-		self.w_attn_out = CastedLinear(config.n_embd, config.n_embd).weight
-
-		# out proj weights
+		self.swiglu = CastedLinear(config.n_embd, config.n_embd*2)
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
-		# tao values
-		self.tao = CastedLinear(1, 3).weight
+	def forward(self, x):
+		# swiglu ffn calculation
+		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
+		y = x + self.out(u * F.silu(v))
 
-	# normalize here (fixes initial scale)
-	def w_norm(self, w, n):
-		target_std = n ** -0.5
-		return w * (target_std / (w.std() + 1e-8))
+		# update weights
+		uv = (u.transpose(1, 2) @ F.silu(v)).mean(dim=0)
+		m = torch.arange(1, (self.f_qkv * 6)/2).unsqueeze(1).unsqueeze(1)
 
-	# return the new "old" & "current" weights.
-	def forward(self, x, y, w, update=True):
-		# retention mechanism produced qkv, swiglu & out proj weights
-		w_qkv, w_swiglu, w_out = w
+		# rms norm & [-pi, pi] norm
+		uv_norm = norm(uv).unsqueeze(0)
+		uv_ones = torch.ones(uv_norm.shape)
+		uv_pi = F.tanh(uv) * 3.14 * m
+
+		# [uv, sin(uv), sin(2*uv), sin(3*uv), ..., cos(uv), cos(2*uv), cos(3*uv), ...]
+		uv = torch.cat([uv_ones, uv_norm, torch.sin(uv_pi), torch.cos(uv_pi)], dim=0)
 
 		# swiglu ffn calculation
-		u, v = F.linear(y, w_swiglu).chunk(2, dim=-1)
-		y = x + F.linear(u * F.silu(v), w_out)
+		u, v = self.swiglu(uv).chunk(2, dim=-1)
+		uv = uv + self.out(u * F.silu(v))
+		uv = uv.view(6 * self.n_qkv, self.n_embd)
+		uv = uv * (uv.size(0) ** -0.5)
 
-		if not update:
-			return y
+		# retention mechanism produced qkv, attn out proj & swiglu weights
+		w_qkv, w_attn_out, w_swiglu = torch.split(uv, [3*self.n_qkv, self.n_qkv, 2*self.n_qkv], dim=0)
+		return y, (w_qkv, w_attn_out.T, w_swiglu)
 
-		# split the tao values into 3, alpha, beta & gamma
-		alpha, beta, gamma = torch.abs(self.tao).clamp(1e-8, 1)
-
-		# calculate adjusted-original value
-		# compact O & A of shape (B, T, C) -> (B, C, C) -> (C, C) shape
-		ao = (u.transpose(1, 2) @ v).mean(dim=0) * (self.n_embd ** -0.5)
-		ao = norm(ao)
-
-		# update qkv weights
-		n = w_qkv @ ao
-		n = F.silu(n)
-		w_qkv = w_qkv + self.out(n)
-		w_qkv = self.w_norm(w_qkv, self.n_embd) * alpha
-
-		# update swiglu weights
-		n = w_swiglu.view(self.n_embd, 2*self.n_qkv).T @ ao
-		n = F.silu(n)
-		n = self.out(n)
-		w_swiglu = w_swiglu + n.T.contiguous().view(2*self.n_embd, self.n_qkv)
-		w_swiglu = self.w_norm(w_swiglu, self.n_qkv) * beta
-
-		# update out weights
-		n = w_out @ ao
-		n = F.silu(n)
-		w_out = w_out + self.out(n)
-		w_out = self.w_norm(w_out, self.n_qkv) * gamma
-
-		return y, (w_qkv, w_swiglu, w_out)
-
-# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
-class AttentionFreeTransformer(nn.Module):
-	def __init__(self):
+# new version of my AttentionOnDetail attention mechanism
+class TheExpertAbundance(nn.Module):
+	def __init__(self, config: Config):
 		super().__init__()
+		self.d_head = config.n_qkv // config.n_head
+		self.n_head = config.n_head
 
-	def forward(self, x, w_qkv):
-		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = F.linear(norm(x), w_qkv).chunk(3, dim=-1) # (B, T, C)
+	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
+	def aft(self, qkv):
+		q, k, v = qkv.chunk(3, dim=-1) # (B, T, C)
 		q, k = norm(q), norm(k) # QK norm
 
 		# exponentiate keys
@@ -132,21 +105,10 @@ class AttentionFreeTransformer(nn.Module):
 		y = kv / (w + 1e-6)
 
 		# gate with query
-		return x, F.sigmoid(q) * y
+		return F.sigmoid(q) * y
 
-# new version of my AttentionOnDetail attention mechanism
-class TheExpertAbundance(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.d_head = config.n_qkv // config.n_head
-		self.n_head = config.n_head
-
-	def forward(self, x, cos_sin, w_qkv):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
-
-		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = F.linear(norm(x), w_qkv).view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
+	def spda(self, B, T, qkv, cos_sin):
+		q, k, v = qkv.view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -160,32 +122,42 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		return x, y.transpose(1, 2).contiguous().view(B, T, -1)
+		return y.transpose(1, 2).contiguous().view(B, T, -1)
+
+	def forward(self, x, cos_sin, w_qkv, w_out, i):
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, _ = x.size()
+
+		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
+		qkv = F.linear(norm(x), w_qkv)
+		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
+		out = F.linear(attn, w_out)
+		return x + out
+
+class Swiglu(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.out = CastedLinear(config.n_qkv, config.n_embd)
+
+	def forward(self, x, w_swiglu):
+		u, v = F.linear(norm(x), w_swiglu).chunk(2, dim=-1)
+		return x + self.out(u * F.silu(v))
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 		self.r_layer = config.r_layer
-		self.n_embd = config.n_embd
-		self.n_qkv = config.n_qkv
 
-		self.aft = AttentionFreeTransformer()
 		self.tea = TheExpertAbundance(config)
 		self.retention = RetentionMechanism(config)
+		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
-		w_qkv, w_swiglu, w_out = self.retention.w_attn_qkv, self.retention.w_attn_swiglu, self.retention.w_attn_out
-
-		# 3 consecutive global-linear attentions,
-		# then 1 local-scaled-dot-product attention
 		for i in range(self.r_layer):
-			x, y = self.tea(x, cos_sin, w_qkv) if (i + 1) % 4 == 0 else self.aft(x, w_qkv)
-			x, w = self.retention(x, y, (w_qkv, w_swiglu, w_out))
-			w_qkv, w_swiglu, w_out = w
-
-		# one final TEA forward pass
-		x, y = self.tea(x, cos_sin, w_qkv)
-		return self.retention(x, y, (w_qkv, w_swiglu, w_out), False)
+			x, (w_qkv, w_attn_out, w_swiglu) = self.retention(x)
+			x = self.tea(x, cos_sin, w_qkv, w_attn_out, i)
+			x = self.swiglu(x, w_swiglu)
+		return x
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
