@@ -51,35 +51,33 @@ class RetentionMechanism(nn.Module):
 		self.n_embd = config.n_embd
 		self.n_qkv = config.n_qkv
 
-		self.swiglu = CastedLinear(config.n_embd, config.n_embd*2)
-		self.out = CastedLinear(config.n_embd, config.n_embd)
+		self.swiglu = CastedLinear(config.n_embd, (config.n_embd // 8)*2)
+		self.out = CastedLinear((config.n_embd // 8), config.n_embd)
 
 	def forward(self, x):
 		# swiglu ffn calculation
 		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
-		y = x + self.out(u * F.silu(v))
 
 		# update weights
-		uv = (u.transpose(1, 2) @ F.silu(v)).mean(dim=0)
-		m = torch.arange(1, (self.f_qkv * 6)/2).unsqueeze(1).unsqueeze(1)
+		y = u.transpose(2, 1) @ F.silu(v) * (u.size(-1) ** -0.5)
+		y = y.mean(dim=0).unsqueeze(0)
+		ones = torch.ones(y.shape)
 
-		# rms norm & [-pi, pi] norm
-		uv_norm = norm(uv).unsqueeze(0)
-		uv_ones = torch.ones(uv_norm.shape)
-		uv_pi = F.tanh(uv) * 3.14 * m
+		# norm b/w [-pi, pi]
+		m = torch.arange(1, (self.f_qkv * 4)/2).unsqueeze(1).unsqueeze(1)
+		pi = F.tanh(y * m) * 3.14
 
-		# [uv, sin(uv), sin(2*uv), sin(3*uv), ..., cos(uv), cos(2*uv), cos(3*uv), ...]
-		uv = torch.cat([uv_ones, uv_norm, torch.sin(uv_pi), torch.cos(uv_pi)], dim=0)
+		# [y, sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
+		y = torch.cat([ones, y, torch.sin(pi), torch.cos(pi)], dim=0)
 
-		# swiglu ffn calculation
-		u, v = self.swiglu(uv).chunk(2, dim=-1)
-		uv = uv + self.out(u * F.silu(v))
-		uv = uv.view(6 * self.n_qkv, self.n_embd)
-		uv = uv * (uv.size(0) ** -0.5)
+		# `(C/8, C/8)` -> `(C, C)`
+		y = self.out(y).repeat_interleave(8, dim=1)
+		y = y.view(4 * self.n_qkv, self.n_embd)
 
-		# retention mechanism produced qkv, attn out proj & swiglu weights
-		w_qkv, w_attn_out, w_swiglu = torch.split(uv, [3*self.n_qkv, self.n_qkv, 2*self.n_qkv], dim=0)
-		return y, (w_qkv, w_attn_out.T, w_swiglu)
+		# retention mechanism produced qkv & out proj
+		w_qkv, w_out = torch.split(y, [3*self.n_qkv, self.n_qkv], dim=0)
+		w_qkv, w_out = w_qkv * (self.n_embd ** -0.5), w_out.T * (self.n_qkv ** -0.5)
+		return w_qkv, w_out
 
 # new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
@@ -87,6 +85,10 @@ class TheExpertAbundance(nn.Module):
 		super().__init__()
 		self.d_head = config.n_qkv // config.n_head
 		self.n_head = config.n_head
+
+		self.qkv = CastedLinear(config.n_embd, config.n_qkv*3)
+		self.out = CastedLinear(config.n_qkv, config.n_embd)
+		self.tao = nn.Parameter(torch.tensor([-4.9]))
 
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 	def aft(self, qkv):
@@ -129,19 +131,15 @@ class TheExpertAbundance(nn.Module):
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkv = F.linear(norm(x), w_qkv)
-		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
-		out = F.linear(attn, w_out)
-		return x + out
+		qkv1 = self.qkv(norm(x))
+		attn1 = self.spda(B, T, qkv1, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv1)
+		out1 = self.out(attn1)
 
-class Swiglu(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.out = CastedLinear(config.n_qkv, config.n_embd)
+		qkv2 = F.linear(norm(x), w_qkv)
+		attn2 = self.spda(B, T, qkv2, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv2)
+		out2 = F.linear(attn2, w_out)
 
-	def forward(self, x, w_swiglu):
-		u, v = F.linear(norm(x), w_swiglu).chunk(2, dim=-1)
-		return x + self.out(u * F.silu(v))
+		return x + out1 + out2 * F.sigmoid(self.tao)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
@@ -150,13 +148,11 @@ class Block(nn.Module):
 
 		self.tea = TheExpertAbundance(config)
 		self.retention = RetentionMechanism(config)
-		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
 		for i in range(self.r_layer):
-			x, (w_qkv, w_attn_out, w_swiglu) = self.retention(x)
-			x = self.tea(x, cos_sin, w_qkv, w_attn_out, i)
-			x = self.swiglu(x, w_swiglu)
+			w_qkv, w_out = self.retention(x)
+			x = self.tea(x, cos_sin, w_qkv, w_out, i)
 		return x
 
 class Strawberry(nn.Module):
