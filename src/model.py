@@ -97,6 +97,9 @@ class TheExpertAbundance(nn.Module):
 		self.d_head = config.n_qkv // config.n_head
 		self.n_head = config.n_head
 
+		self.qkv = CastedLinear(config.n_embd, config.n_qkv*3)
+		self.out = CastedLinear(config.n_qkv, config.n_embd)
+
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 	def aft(self, qkv):
 		q, k, v = qkv.chunk(3, dim=-1) # (B, T, C)
@@ -141,9 +144,9 @@ class TheExpertAbundance(nn.Module):
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkv = F.linear(norm(x), w_qkv)
+		qkv = F.linear(norm(x), self.qkv.weight + w_qkv)
 		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
-		return x + F.linear(attn, w_out)
+		return x + F.linear(attn, self.out.weight + w_out)
 
 class Swiglu(nn.Module):
 	def __init__(self, config: Config):
