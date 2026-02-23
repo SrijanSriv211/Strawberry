@@ -369,3 +369,29 @@ for _ in range(n_steps):
 
 print0("total time:", calc_total_time(time.time() - start_time), log_path=log_path)
 torch.save(get_state(model, optimizers), CONFIG["model_path"])
+
+losses = estimate_loss(model, dataset.next_batch)
+eval_t1 = time.time()
+eval_dt = eval_t1 - eval_t0
+eval_t0 = eval_t1
+
+print0(
+	f"{Fore.WHITE}{Style.BRIGHT}step",
+	f"{Fore.WHITE}{Style.DIM}[{stats["step"]}/{CONFIG["max_iters"]}]"
+	f"{Fore.RESET}{Style.RESET_ALL}:",
+	f"train loss {Fore.WHITE}{Style.BRIGHT}{losses["train"]:.4f}"
+	f"{Fore.RESET}{Style.RESET_ALL},",
+	f"val loss {Fore.WHITE}{Style.BRIGHT}{losses["val"]:.4f}"
+	f"{Fore.RESET}{Style.RESET_ALL},",
+	f"lr {Fore.WHITE}{Style.BRIGHT}{lr:.7f}"
+	f"{Fore.RESET}{Style.RESET_ALL},",
+	f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}",
+	log_path=log_path
+)
+stats["loss"]["train"].append(losses["train"])
+stats["loss"]["val"].append(losses["val"])
+stats["step"] += 1
+
+### sample generation
+out = model.generate([], sink_tok, hyperparams["block_size"])[0].tolist()
+print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)

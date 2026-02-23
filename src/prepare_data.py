@@ -5,7 +5,7 @@ import argparse, pickle, json, os
 
 init(autoreset=True)
 
-# python src/prepare_data.py -i dat -e bin/cl4k.bin
+# python src/prepare_data.py -i data -e bin/cl4k.bin
 parser = argparse.ArgumentParser(description="Prepare training & val dataset")
 parser.add_argument("-i", help="dataset path", required=True)
 parser.add_argument("-e", help="encoder path", required=True)

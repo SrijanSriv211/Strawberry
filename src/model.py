@@ -56,36 +56,38 @@ class RetentionMechanism(nn.Module):
 		self.out = CastedLinear(self.lr_embd, config.n_embd)
 
 	def forward(self, x):
-		# swiglu ffn calculation
+		# (B, T, C) -> (B, T, 2R)
 		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
 
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = u.size()
-
-		# update weights
-		u, v = u.view(B*T, C), v.view(B*T, C)
+		# (B, T, 2R) -> (R, R) -> (1, R, R)
+		u, v = u.view(-1, self.lr_embd), v.view(-1, self.lr_embd)
 		y = u.T @ v
-		y = y * (B*T)**-0.5
+		y = y * u.size(0)**-0.5
 		y = y.unsqueeze(0)
-		ones = torch.ones(y.shape)
+
+		# (4 * f_qkv)/2 -> 4 cuz we have QKVO. 4 tensors of same shape.
+		# `f_qkv` is the expansion factor between `n_embd` & `n_qkv`.
+		# `/2` cuz we will have same shape in sin & cos to double it.
+		m = torch.arange(1, (4 * self.f_qkv)/2).unsqueeze(1).unsqueeze(1)
 
 		# norm b/w [-pi, pi]
-		m = torch.arange(1, (4 * self.f_qkv)/2).unsqueeze(1).unsqueeze(1)
-		pi = F.tanh(y * m) * 3.14
+		pi = F.tanh(y) * torch.pi * m
 
-		# [sigmoid(y), sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
-		y = torch.cat([ones, F.sigmoid(y), torch.sin(pi), torch.cos(pi)], dim=0)
+		# [1, sigmoid(y), sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
+		y = torch.cat([torch.ones(y.shape), F.sigmoid(y), torch.sin(pi), torch.cos(pi)], dim=0)
 
-		# `(C/8, C/8)` -> `(C, C)`
-		y = self.out(y).repeat_interleave(8, dim=1)
+		# (16, R, R) -> (4*D, C)
+		y = self.out(y)
+		y = self.out(y.transpose(1, 2))
+		y = y.transpose(1, 2).contiguous()
 		y = y.view(4 * self.n_qkv, self.n_embd)
 
 		# retention mechanism produced qkv & out proj
 		w_qkv, w_out = torch.split(y, [3*self.n_qkv, self.n_qkv], dim=0)
 
 		# normalize
-		w_qkv = F.normalize(w_qkv, dim=1) * self.n_embd**-0.5
-		w_out = F.normalize(w_out.T, dim=1) * self.n_qkv**-0.5
+		w_qkv = F.normalize(w_qkv, dim=0) * self.n_embd**-0.5
+		w_out = F.normalize(w_out.T, dim=0) * self.n_qkv**-0.5
 		return w_qkv, w_out
 
 # new version of my AttentionOnDetail attention mechanism
@@ -94,9 +96,6 @@ class TheExpertAbundance(nn.Module):
 		super().__init__()
 		self.d_head = config.n_qkv // config.n_head
 		self.n_head = config.n_head
-
-		self.qkv = CastedLinear(config.n_embd, config.n_qkv*3)
-		self.out = CastedLinear(config.n_qkv, config.n_embd)
 
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 	def aft(self, qkv):
@@ -142,9 +141,9 @@ class TheExpertAbundance(nn.Module):
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkv = F.linear(norm(x), self.qkv.weight + w_qkv)
+		qkv = F.linear(norm(x), w_qkv)
 		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
-		return x + F.linear(attn, self.out.weight + w_out)
+		return x + F.linear(attn, w_out)
 
 class Swiglu(nn.Module):
 	def __init__(self, config: Config):
@@ -155,7 +154,7 @@ class Swiglu(nn.Module):
 	def forward(self, x):
 		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
 		y = u * F.silu(v)
-		return self.out(y)
+		return x + self.out(y)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
