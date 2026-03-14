@@ -43,6 +43,7 @@ class CastedLinear(nn.Module):
 class TheExpertAbundance(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
+		self.qkv = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
@@ -64,7 +65,7 @@ class TheExpertAbundance(nn.Module):
 		# gate with query
 		return F.sigmoid(q) * y
 
-	def forward(self, x, cos_sin, qkv):
+	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, C = x.size()
 
@@ -74,7 +75,7 @@ class TheExpertAbundance(nn.Module):
 		t0 = torch.cat([t, torch.sin(t0), torch.cos(t0)], dim=-2)
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = qkv(norm(t0)).view(B, T, C, -1).chunk(3, dim=-1) # (B, T, nh, hs)
+		q, k, v = self.qkv(norm(t0)).view(B, T, C, -1).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -98,23 +99,23 @@ class TheExpertAbundance(nn.Module):
 class Swiglu(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
+		self.swiglu = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
-	def forward(self, x, ffn):
-		u, v = ffn(norm(x)).view(*x.size(), -1).chunk(2, dim=-1)
+	def forward(self, x):
+		u, v = self.swiglu(norm(x)).view(*x.size(), -1).chunk(2, dim=-1)
 		y = torch.sum(u * F.silu(v), dim=-1)
 		return x + self.out(y)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.tensor = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
 		self.tea = TheExpertAbundance(config)
 		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
-		x = self.tea(x, cos_sin, self.tensor)
-		return self.swiglu(x, self.tensor)
+		x = self.tea(x, cos_sin)
+		return self.swiglu(x)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
