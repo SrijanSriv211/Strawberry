@@ -6,11 +6,8 @@ import torch.nn as nn, torch
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
-	r_layer: int = 2 # reuse layers
 	n_layer: int = 2 # new layers
-	n_head: int = 4
 	n_embd: int = 64
-	n_qkv: int = 256
 
 def norm(x):
 	return F.rms_norm(x, (x.size(-1),))
@@ -43,62 +40,10 @@ class CastedLinear(nn.Module):
 	def forward(self, x):
 		return F.linear(x, self.weight)
 
-class RetentionMechanism(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		assert config.n_qkv % config.n_embd == 0
-		self.f_qkv = config.n_qkv // config.n_embd
-		self.n_embd = config.n_embd
-		self.n_qkv = config.n_qkv
-
-		self.lr_embd = config.n_embd // 8 # low-rank embedding size
-		self.swiglu = CastedLinear(config.n_embd, self.lr_embd*2)
-		self.out = CastedLinear(self.lr_embd, config.n_embd)
-
-	def forward(self, x):
-		# (B, T, C) -> (B, T, 2R)
-		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
-
-		# (B, T, 2R) -> (R, R) -> (1, R, R)
-		u, v = u.view(-1, self.lr_embd), v.view(-1, self.lr_embd)
-		y = u.T @ v
-		y = y * u.size(0)**-0.5
-		y = y.unsqueeze(0)
-
-		# (4 * f_qkv)/2 -> 4 cuz we have QKVO. 4 tensors of same shape.
-		# `f_qkv` is the expansion factor between `n_embd` & `n_qkv`.
-		# `/2` cuz we will have same shape in sin & cos to double it.
-		m = torch.arange(1, (4 * self.f_qkv)/2).unsqueeze(1).unsqueeze(1)
-
-		# norm b/w [-pi, pi]
-		pi = F.tanh(y) * torch.pi * m
-
-		# [1, sigmoid(y), sin(y), sin(2*y), sin(3*y), ..., cos(y), cos(2*y), cos(3*y), ...]
-		y = torch.cat([torch.ones(y.shape), F.sigmoid(y), torch.sin(pi), torch.cos(pi)], dim=0)
-
-		# (16, R, R) -> (4*D, C)
-		y = self.out(y)
-		y = self.out(y.transpose(1, 2))
-		y = y.transpose(1, 2).contiguous()
-		y = y.view(4 * self.n_qkv, self.n_embd)
-
-		# retention mechanism produced qkv & out proj
-		w_qkv, w_out = torch.split(y, [3*self.n_qkv, self.n_qkv], dim=0)
-
-		# normalize
-		w_qkv = F.normalize(w_qkv, dim=0) * self.n_embd**-0.5
-		w_out = F.normalize(w_out.T, dim=0) * self.n_qkv**-0.5
-		return w_qkv, w_out
-
-# new version of my AttentionOnDetail attention mechanism
 class TheExpertAbundance(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.d_head = config.n_qkv // config.n_head
-		self.n_head = config.n_head
-
-		self.qkv = CastedLinear(config.n_embd, config.n_qkv*3)
-		self.out = CastedLinear(config.n_qkv, config.n_embd)
+		self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
 	def aft(self, qkv):
@@ -119,8 +64,17 @@ class TheExpertAbundance(nn.Module):
 		# gate with query
 		return F.sigmoid(q) * y
 
-	def spda(self, B, T, qkv, cos_sin):
-		q, k, v = qkv.view(B, T, self.n_head, 3*self.d_head).chunk(3, dim=-1) # (B, T, nh, hs)
+	def forward(self, x, cos_sin, qkv):
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, C = x.size()
+
+		# normalize `x` b/w [-pi, pi]
+		t = norm(x.unsqueeze(-2))
+		t0 = torch.tanh(t) * torch.pi
+		t0 = torch.cat([t, torch.sin(t0), torch.cos(t0)], dim=-2)
+
+		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
+		q, k, v = qkv(norm(t0)).view(B, T, C, -1).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -134,45 +88,33 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		y = y.transpose(1, 2).contiguous().view(B, T, C, C)
 
-		# add non-linearity to avoid collapsing & improving expressivity
-		return F.silu(y)
-
-	def forward(self, x, cos_sin, w_qkv, w_out, i):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
-
-		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkv = F.linear(norm(x), self.qkv.weight + w_qkv)
-		attn = self.spda(B, T, qkv, cos_sin) if (i+1) % 4 == 0 else self.aft(qkv)
-		return x + F.linear(attn, self.out.weight + w_out)
+		# mini-swiglu to make attention more expressive
+		u, v = y.chunk(2, dim=-1)
+		y = (u * F.silu(v)).sum(dim=-1)
+		return x + self.out(y)
 
 class Swiglu(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.swiglu = CastedLinear(config.n_embd, 4*config.n_embd*2)
-		self.out = CastedLinear(4*config.n_embd, config.n_embd)
+		self.out = CastedLinear(config.n_embd, config.n_embd)
 
-	def forward(self, x):
-		u, v = self.swiglu(norm(x)).chunk(2, dim=-1)
-		y = u * F.silu(v)
+	def forward(self, x, ffn):
+		u, v = ffn(norm(x)).view(*x.size(), -1).chunk(2, dim=-1)
+		y = torch.sum(u * F.silu(v), dim=-1)
 		return x + self.out(y)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.r_layer = config.r_layer
-
-		self.retention = RetentionMechanism(config)
+		self.tensor = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
 		self.tea = TheExpertAbundance(config)
 		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
-		for i in range(self.r_layer):
-			w_qkv, w_out = self.retention(x)
-			x = self.tea(x, cos_sin, w_qkv, w_out, i)
-		return self.swiglu(x)
+		x = self.tea(x, cos_sin, self.tensor)
+		return self.swiglu(x, self.tensor)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
@@ -192,8 +134,7 @@ class Strawberry(nn.Module):
 		# so let's just over-compute them, but assert fail if we ever reach that amount.
 		# in the future we can dynamically grow the cache, for now it's fine.
 		self.rotary_block_size = config.block_size * 10 # 10X over-compute should be enough, TODO make nicer?
-		d_head = config.n_qkv // config.n_head
-		self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_block_size, d_head)
+		self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_block_size, config.n_embd)
 
 	def _precompute_rotary_embeddings(self, block_size, d_head, base=10000):
 		# stride the channels
