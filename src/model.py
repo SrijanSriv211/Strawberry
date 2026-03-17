@@ -92,9 +92,9 @@ class TheExpertAbundance(nn.Module):
 		y = y.transpose(1, 2).contiguous().view(B, T, C, C)
 
 		# mini-swiglu to make attention more expressive
-		u, v = y.chunk(2, dim=-1)
-		y = (u * F.silu(v)).sum(dim=-1)
-		return x + self.out(y)
+		u, v = y.chunk(2, dim=-2)
+		y = u * F.silu(v)
+		return x + self.out(y).sum(dim=-2)
 
 class Swiglu(nn.Module):
 	def __init__(self, config: Config):
@@ -103,9 +103,9 @@ class Swiglu(nn.Module):
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	def forward(self, x):
-		u, v = self.swiglu(norm(x)).view(*x.size(), -1).chunk(2, dim=-1)
-		y = torch.sum(u * F.silu(v), dim=-1)
-		return x + self.out(y)
+		u, v = self.swiglu(norm(x)).view(*x.size(), -1).chunk(2, dim=-2)
+		y = u * F.silu(v)
+		return x + self.out(y).sum(dim=-2)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
