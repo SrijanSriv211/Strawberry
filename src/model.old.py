@@ -7,7 +7,6 @@ class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
 	n_layer: int = 2 # new layers
-	n_head: int = 4
 	n_embd: int = 64
 
 def norm(x):
@@ -20,19 +19,6 @@ def apply_rotary_emb(x, cos, sin):
 	y1 = x1 * cos + x2 * sin # rotate pairs of dims
 	y2 = x1 * (-sin) + x2 * cos
 	return torch.cat([y1, y2], 3)
-
-def fourier_features(x, n_head):
-	# (1, 1, nh, 1)
-	m = torch.arange(1, n_head+1).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-
-	# (B, T, 1, C)
-	t = x.unsqueeze(-2)
-
-	# normalize `x` b/w [-pi, pi]
-	t0 = torch.tanh(t) * torch.pi * m # (B, T, nh, C)
-
-	# [t, sin(t), sin(2*t), sin(3*t), ..., cos(t), cos(2*t), cos(3*t), ...]
-	return torch.cat([t * m, torch.sin(t0), torch.cos(t0)], dim=-2) # (B, T, 3nh, C)
 
 class CastedLinear(nn.Module):
 	def __init__(self, in_features, out_features):
@@ -57,25 +43,44 @@ class CastedLinear(nn.Module):
 class TheExpertAbundance(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.n_head = config.n_head
-		self.qkv = CastedLinear(config.n_embd, config.n_embd)
-		self.out = CastedLinear(config.n_embd*self.n_head, config.n_embd)
+		self.qkv = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
+		self.out = CastedLinear(config.n_embd, config.n_embd)
+
+	# calculate AFT attention (https://arxiv.org/pdf/2105.14103)
+	def aft(self, qkv):
+		q, k, v = qkv.chunk(3, dim=-1) # (B, T, C)
+		q, k = norm(q), norm(k) # QK norm
+
+		# exponentiate keys
+		w = torch.exp(k)
+		kv = w * v
+
+		# causal cumulative sums
+		w = torch.cumsum(w, dim=1)
+		kv = torch.cumsum(kv, dim=1)
+
+		# normalize
+		y = kv / (w + 1e-6)
+
+		# gate with query
+		return F.sigmoid(q) * y
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
+		B, T, C = x.size()
 
-		# (B, T, C) -> (B, T, 3nh, C)
-		t = fourier_features(norm(x), self.n_head)
+		# normalize `x` b/w [-pi, pi]
+		t = norm(x.unsqueeze(-2))
+		t0 = torch.tanh(t) * torch.pi
+		t0 = torch.cat([t, torch.sin(t0), torch.cos(t0)], dim=-2)
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = self.qkv(norm(t)).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, C)
+		q, k, v = self.qkv(norm(t0)).view(B, T, C, -1).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
 		q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
 		q, k = norm(q), norm(k) # QK norm
-		q = F.silu(q)
 
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
 		q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -84,51 +89,33 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		y = y.transpose(1, 2).contiguous().view(B, T, C, C)
 
-		# (B, T, nh*C) -> (B, T, C)
-		# post normalization & relu square
-		y = norm(y)
-		y = F.relu(y).square()
-		return x + self.out(y)
+		# mini-swiglu to make attention more expressive
+		u, v = y.chunk(2, dim=-2)
+		y = u * F.silu(v)
+		return x + self.out(y).sum(dim=-2)
 
-# Silu attention
-class Silia(nn.Module):
+class Swiglu(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.uvw = CastedLinear(config.n_embd, config.n_embd)
+		self.swiglu = CastedLinear(config.n_embd, config.n_embd*config.n_embd)
 		self.out = CastedLinear(config.n_embd, config.n_embd)
 
 	def forward(self, x):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
-
-		# (B, T, C) -> (B, T, 3nh, C)
-		t = fourier_features(norm(x), 1)
-
-		# (B, T, C)
-		u, v, w = self.uvw(norm(t)).view(B, T, -1).chunk(3, dim=-1)
-		u, v = norm(u), norm(v)
-		v = F.silu(v)
-
-		# silu attention
-		y = u @ v.transpose(1, 2) * u.size(-1)**-0.5
-		y = F.sigmoid(y) @ w
-
-		# post normalization & relu square
-		y = norm(y)
-		y = F.relu(y).square()
-		return x + self.out(y)
+		u, v = self.swiglu(norm(x)).view(*x.size(), -1).chunk(2, dim=-2)
+		y = u * F.silu(v)
+		return x + self.out(y).sum(dim=-2)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 		self.tea = TheExpertAbundance(config)
-		self.silia = Silia(config)
+		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
 		x = self.tea(x, cos_sin)
-		return self.silia(x)
+		return self.swiglu(x)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
