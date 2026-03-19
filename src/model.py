@@ -41,21 +41,22 @@ class CastedLinear(nn.Module):
 	def forward(self, x):
 		return F.linear(x, self.weight)
 
-class TheExpertAbundance(nn.Module):
-	def __init__(self, config: Config, chunk=1):
+class AttentionOnDetail(nn.Module):
+	def __init__(self, config: Config):
 		super().__init__()
 		self.n_head = config.n_head
+		self.n_embd = config.n_embd
 		n_qkv = config.n_embd * self.n_head
 
-		self.qkv = CastedLinear(config.n_embd, 3*n_qkv)
-		self.out = CastedLinear(n_qkv, config.n_embd*chunk)
+		self.qkv1 = CastedLinear(config.n_embd, 4*n_qkv)
+		self.qkv2 = CastedLinear(n_qkv, 4*n_qkv)
 
-	def forward(self, x, cos_sin):
+	def sdpa(self, x, cos_sin, qkv):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = self.qkv(x).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, C)
+		q, k, v = qkv(x).view(B, T, self.n_head, -1).split([self.n_embd, self.n_embd, 2*self.n_embd], dim=-1) # (B, T, nh, C)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -69,43 +70,24 @@ class TheExpertAbundance(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		y = y.transpose(1, 2).contiguous().view(B, T, -1)
-		return self.out(y)
-
-# Silu in Attention
-class Silia(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.tea1 = TheExpertAbundance(config, chunk=2)
-		self.tea2 = TheExpertAbundance(config)
+		return y.transpose(1, 2).contiguous().view(B, T, -1)
 
 	def forward(self, x, cos_sin):
-		u, v = self.tea1(norm(x), cos_sin).chunk(2, dim=-1)
-		y = u * F.silu(v)
-		return x + self.tea2(y, cos_sin)
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, _ = x.size()
 
-class Swiglu(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		n_ffn = config.n_embd * 4
+		u, v = self.sdpa(norm(x), cos_sin, self.qkv1).chunk(2, dim=-1)
+		u, v = self.sdpa(u * F.silu(v), cos_sin, self.qkv2).view(B, T, self.n_head, -1).chunk(2, dim=-1)
 
-		self.uv = CastedLinear(config.n_embd, 2*n_ffn)
-		self.out = CastedLinear(n_ffn, config.n_embd)
-
-	def forward(self, x):
-		u, v = self.uv(norm(x)).chunk(2, dim=-1)
-		y = u * F.silu(v)
-		return x + self.out(y)
+		return torch.sum(u * torch.softmax(v, dim=-2), dim=-2)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.silia = Silia(config)
-		self.swiglu = Swiglu(config)
+		self.aod = AttentionOnDetail(config)
 
 	def forward(self, x, cos_sin):
-		y = self.silia(x, cos_sin)
-		return self.swiglu(y)
+		return self.aod(x, cos_sin)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
