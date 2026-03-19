@@ -21,19 +21,6 @@ def apply_rotary_emb(x, cos, sin):
 	y2 = x1 * (-sin) + x2 * cos
 	return torch.cat([y1, y2], 3)
 
-def fourier_features(x, n_head):
-	# (1, 1, nh, 1)
-	m = torch.arange(1, n_head+1).unsqueeze(0).unsqueeze(0).unsqueeze(-1)
-
-	# (B, T, 1, C)
-	t = x.unsqueeze(-2)
-
-	# normalize `x` b/w [-pi, pi]
-	t0 = torch.tanh(t) * torch.pi * m # (B, T, nh, C)
-
-	# [t, sin(t), sin(2*t), sin(3*t), ..., cos(t), cos(2*t), cos(3*t), ...]
-	return torch.cat([t * m, torch.sin(t0), torch.cos(t0)], dim=-2) # (B, T, 3nh, C)
-
 class CastedLinear(nn.Module):
 	def __init__(self, in_features, out_features):
 		super().__init__()
@@ -55,27 +42,25 @@ class CastedLinear(nn.Module):
 		return F.linear(x, self.weight)
 
 class TheExpertAbundance(nn.Module):
-	def __init__(self, config: Config):
+	def __init__(self, config: Config, chunk=1):
 		super().__init__()
 		self.n_head = config.n_head
-		self.qkv = CastedLinear(config.n_embd, config.n_embd)
-		self.out = CastedLinear(config.n_embd*self.n_head, config.n_embd)
+		n_qkv = config.n_embd * self.n_head
+
+		self.qkv = CastedLinear(config.n_embd, 3*n_qkv)
+		self.out = CastedLinear(n_qkv, config.n_embd*chunk)
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
-		# (B, T, C) -> (B, T, 3nh, C)
-		t = fourier_features(norm(x), self.n_head)
-
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = self.qkv(norm(t)).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, C)
+		q, k, v = self.qkv(x).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, C)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
 		q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
 		q, k = norm(q), norm(k) # QK norm
-		q = F.silu(q)
 
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
 		q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -85,50 +70,42 @@ class TheExpertAbundance(nn.Module):
 
 		# re-assemble all head outputs side by side
 		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		return self.out(y)
 
-		# (B, T, nh*C) -> (B, T, C)
-		# post normalization & relu square
-		y = norm(y)
-		y = F.relu(y).square()
-		return x + self.out(y)
-
-# Silu attention
+# Silu in Attention
 class Silia(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.uvw = CastedLinear(config.n_embd, config.n_embd)
-		self.out = CastedLinear(config.n_embd, config.n_embd)
+		self.tea1 = TheExpertAbundance(config, chunk=2)
+		self.tea2 = TheExpertAbundance(config)
+
+	def forward(self, x, cos_sin):
+		u, v = self.tea1(norm(x), cos_sin).chunk(2, dim=-1)
+		y = u * F.silu(v)
+		return x + self.tea2(y, cos_sin)
+
+class Swiglu(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		n_ffn = config.n_embd * 4
+
+		self.uv = CastedLinear(config.n_embd, 2*n_ffn)
+		self.out = CastedLinear(n_ffn, config.n_embd)
 
 	def forward(self, x):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
-
-		# (B, T, C) -> (B, T, 3nh, C)
-		t = fourier_features(norm(x), 1)
-
-		# (B, T, C)
-		u, v, w = self.uvw(norm(t)).view(B, T, -1).chunk(3, dim=-1)
-		u, v = norm(u), norm(v)
-		v = F.silu(v)
-
-		# silu attention
-		y = u @ v.transpose(1, 2) * u.size(-1)**-0.5
-		y = F.sigmoid(y) @ w
-
-		# post normalization & relu square
-		y = norm(y)
-		y = F.relu(y).square()
+		u, v = self.uv(norm(x)).chunk(2, dim=-1)
+		y = u * F.silu(v)
 		return x + self.out(y)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.tea = TheExpertAbundance(config)
 		self.silia = Silia(config)
+		self.swiglu = Swiglu(config)
 
 	def forward(self, x, cos_sin):
-		x = self.tea(x, cos_sin)
-		return self.silia(x)
+		y = self.silia(x, cos_sin)
+		return self.swiglu(y)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
