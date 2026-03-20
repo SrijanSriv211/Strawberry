@@ -41,65 +41,21 @@ class CastedLinear(nn.Module):
 	def forward(self, x):
 		return F.linear(x, self.weight)
 
-class RetentionMechanism(nn.Module):
-	def __init__(self, config: Config):
-		super().__init__()
-		self.n_head = config.n_head
-
-		self.l1 = CastedLinear(config.n_embd, config.n_embd)
-		self.l2 = CastedLinear(config.n_embd, config.n_embd)
-		self.out = CastedLinear(config.n_embd, 4*config.n_embd)
-
-	def forward(self, x):
-		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, C = x.size()
-
-		# (1, nh, 1, 1);
-		m = torch.arange(1, self.n_head+1).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-		t = norm(x.unsqueeze(1))
-
-		# norm b/w [-pi, pi]
-		pi = F.tanh(t) * torch.pi * m
-
-		# [t, sin(t), sin(2*t), sin(3*t), ..., cos(t), cos(2*t), cos(3*t), ...]
-		y = torch.stack([t * m, torch.sin(pi), torch.cos(pi)], dim=-2) # (B, nh, T, 3, C)
-
-		# pass into a relu sq. ffn
-		y = self.l1(y)
-		y = F.relu(y).square()
-		y = self.l2(y)
-
-		# break into 3 tensors,
-		# `t` -> the new input tensor; shape (B, T, C)
-		# `w1` & `w2` -> dynamically generated weight tensors; shape (B, nh, T, C)
-		t, w1, w2 = y[:, 0, :, 0, :], y[:, :, :, 1, :], y[:, :, :, 2, :]
-
-		# (B, nh, C, C)
-		y = w1.transpose(-2, -1) @ w2 * 3**0.5 * T**-0.5
-		y = self.out(norm(y.view(B, -1, C)))
-
-		# (B, C, 4C*nh)
-		y = y.transpose(-2, -1).contiguous().view(B, C, -1)
-		return x + t, y
-
 class AttentionOnDetail(nn.Module):
-	def __init__(self, config: Config):
+	def __init__(self, config: Config, chunk=1):
 		super().__init__()
 		self.n_head = config.n_head
-		self.n_embd = config.n_embd
+		n_qkv = config.n_embd * self.n_head
 
-		self.rtn = RetentionMechanism(config)
-		self.out = CastedLinear(self.n_head * self.n_embd, self.n_embd)
+		self.qkv = CastedLinear(config.n_embd, 3*n_qkv)
+		self.out = CastedLinear(n_qkv, config.n_embd*chunk)
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
-		# dynamically generate qkv weights
-		t, w = self.rtn(x)
-
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = torch.bmm(norm(t), w).view(B, T, self.n_head, -1).split([self.n_embd, self.n_embd, 2*self.n_embd], dim=-1) # (B, T, nh, C)
+		q, k, v = self.qkv(x).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -113,21 +69,27 @@ class AttentionOnDetail(nn.Module):
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
 		# re-assemble all head outputs side by side
-		u, v = y.transpose(1, 2).contiguous().view(B, T, -1).chunk(2, dim=-1)
+		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		return self.out(y)
 
-		# Silia: silu in attention
+class Silia(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.attn1 = AttentionOnDetail(config, 2)
+		self.attn2 = AttentionOnDetail(config)
+
+	def forward(self, x, cos_sin):
+		u, v = self.attn1(norm(x), cos_sin).chunk(2, dim=-1)
 		y = u * F.silu(v)
-		return x + self.out(y)
+		return x + self.attn2(y, cos_sin)
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
-		self.attn1 = AttentionOnDetail(config)
-		self.attn2 = AttentionOnDetail(config)
+		self.silia = Silia(config)
 
 	def forward(self, x, cos_sin):
-		y = self.attn1(x, cos_sin)
-		return self.attn2(y, cos_sin)
+		return self.silia(x, cos_sin)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
