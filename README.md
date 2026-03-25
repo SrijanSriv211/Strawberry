@@ -2,12 +2,13 @@
 
 <img src="img/strawberry.png" alt="howmanyrsinthewordstrawberry" style="width:100%;">
 
-Strawberry is primarily an early-stage neural network architecture built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project. Currently not much is implemented, however everything inside this repository is enough to train AI models of various sizes.
+Strawberry is primarily an early-stage experimental neural network architecture built on top of Andrej Karpathy's [nanoGPT](https://github.com/karpathy/nanoGPT) project. Goal of Strawberry is to experiment with different & novel ideas as much, as fast and in as different ways as possible.
 
-Strawberry brings several improvements over the standard GPT-2 architecture, such as:
+Changes over the standard nanoGPT architecture:
 1. Modernized architecture: Rotary embeddings and QK-Norm
 2. Silia (Silu in Attention), replace FFN with attention
-3. Shared embedding weights
+3. Attention residuals proposed by MoonshotAI ([paper](https://arxiv.org/pdf/2603.15031))
+4. Shared embedding weights
 
 ### Architecture Design
 ```
@@ -16,16 +17,13 @@ Input tokens
 [Token Embedding]
     |
 [Strawberry Block xN:]
-    |--- Scaled Dot Product Attention
+    |--- Multi-Headed Attention
     |    |--- Rotary Positional Embeddings
     |    |--- QK Norm
-    |    |--- Multi-Headed Attention
-    |--- SiLU non-linearity
-    |--- Scaled Dot Product Attention
-    |    |--- Rotary Positional Embeddings
-    |    |--- QK Norm
-    |    |--- Multi-Headed Attention
-    |
+    |    |--- Scaled Dot Product Attention
+    |--- Silu activation function
+    |--- Multi-Headed Attention
+    |--- Attention Residuals
 [Output Projection (weight-tied)]
     |
 Next token logits

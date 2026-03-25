@@ -81,15 +81,33 @@ class Silia(nn.Module):
 	def forward(self, x, cos_sin):
 		u, v = self.attn1(norm(x), cos_sin).chunk(2, dim=-1)
 		y = u * F.silu(v)
-		return x + self.attn2(y, cos_sin)
+		return self.attn2(y, cos_sin)
+
+class AttnResidual(nn.Module):
+	def __init__(self, config: Config):
+		super().__init__()
+		self.q = nn.Parameter(torch.zeros(config.n_embd)) # (C)
+
+	def forward(self, x, s):
+		# (N, B, T, C)
+		stack = torch.cat([s, x.unsqueeze(0)], dim=0)
+		k = norm(stack)
+
+		# (N, B, T)
+		y = k @ self.q
+		y = torch.softmax(y, dim=0)
+		y = torch.einsum("NBT,NBTC->BTC", y, stack) # (B, T, C)
+		return y, stack
 
 class Block(nn.Module):
 	def __init__(self, config: Config):
 		super().__init__()
 		self.silia = Silia(config)
+		self.residual = AttnResidual(config)
 
-	def forward(self, x, cos_sin):
-		return self.silia(x, cos_sin)
+	def forward(self, x, cos_sin, stack):
+		y = self.silia(x, cos_sin)
+		return self.residual(y, stack)
 
 class Strawberry(nn.Module):
 	def __init__(self, config: Config):
@@ -133,8 +151,9 @@ class Strawberry(nn.Module):
 		x = self.embed(idx)
 		x = norm(x)
 
+		stack = x.unsqueeze(0)
 		for block in self.blocks:
-			x = block(x, cos_sin)
+			x, stack = block(x, cos_sin, stack)
 
 		# forward the lm_head (compute logits)
 		x = norm(x)
