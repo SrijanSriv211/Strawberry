@@ -337,7 +337,7 @@ for _ in range(n_steps):
 		stats["loss"]["val"].append(losses["val"])
 
 		### sample generation
-		out = model.generate([], sink_tok, hyperparams["block_size"])[0].tolist()
+		out = model.generate([], sink_tok, hyperparams["block_size"], device=device)[0].tolist()
 		print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)
 
 	## log test loss

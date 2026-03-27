@@ -127,7 +127,9 @@ class Strawberry(nn.Module):
 		# so let's just over-compute them, but assert fail if we ever reach that amount.
 		# in the future we can dynamically grow the cache, for now it's fine.
 		self.rotary_block_size = config.block_size * 10 # 10X over-compute should be enough, TODO make nicer?
-		self.cos, self.sin = self._precompute_rotary_embeddings(self.rotary_block_size, config.n_embd)
+		cos, sin = self._precompute_rotary_embeddings(self.rotary_block_size, config.n_embd)
+		self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
+		self.register_buffer("sin", sin, persistent=False)
 
 	def _precompute_rotary_embeddings(self, block_size, d_head, base=10000):
 		# stride the channels
@@ -164,9 +166,9 @@ class Strawberry(nn.Module):
 		return logits, loss
 
 	@torch.no_grad()
-	def generate(self, idx, sink_tok, max_new_tokens, temperature=1.0, top_k=None):
-		sink_tok = torch.tensor([sink_tok], dtype=torch.int64).unsqueeze(0)
-		idx = torch.tensor(idx, dtype=torch.int64).unsqueeze(0)
+	def generate(self, idx, sink_tok, max_new_tokens, device, temperature=1.0, top_k=None):
+		sink_tok = torch.tensor([sink_tok], dtype=torch.int64, device=device).unsqueeze(0)
+		idx = torch.tensor(idx, dtype=torch.int64, device=device).unsqueeze(0)
 
 		for _ in range(max_new_tokens):
 			# our very first step, pass the initial sequence context to the model

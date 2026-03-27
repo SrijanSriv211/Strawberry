@@ -35,7 +35,7 @@ def generate(i, e, l=256, t=0.8, f=None, T=None):
 	# encode text and generate output
 	enctxt = enc.encode(T, allowed_special="all") if T is not None else []
 	out = model.generate(
-		enctxt, enc.special_tokens["<|sink|>"],
+		enctxt, enc.special_tokens["<|sink|>"], device=device,
 		max_new_tokens=l, temperature=t, top_k=f
 	)[0].tolist()
 	return enc.decode(out)
@@ -80,6 +80,7 @@ if __name__ == "__main__":
 		"What is 2+2<|eop|>",
 		"Tell me something about spacetime<|eop|>",
 		"Why do we think that we can't think if we couldn't think<|eop|>",
+		"Write a",
 		"",
 		"",
 		""
