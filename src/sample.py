@@ -5,9 +5,7 @@ from encoder import Encoder
 from colorama import Style, Fore, init
 import argparse, torch
 
-def generate(i, e, l=256, t=0.8, f=None, T=None):
-	device = "cuda" if torch.cuda.is_available() else "cpu"
-
+def generate(i, e, l=256, t=0.8, f=None, T=None, device="cpu"):
 	# create an instance of Strawberry
 	conf = Config(**i["hyperparams"])
 	model = Strawberry(conf)
@@ -95,5 +93,6 @@ if __name__ == "__main__":
 		elif text.strip() == "":
 			text = None
 
-		out = generate(torch.load(args.model), args.encoder, args.length, args.temperature, args.top_k, text)
+		device = "cuda" if torch.cuda.is_available() else "cpu"
+		out = generate(torch.load(args.model, map_location=device), args.encoder, args.length, args.temperature, args.top_k, text, device)
 		print(f"{Fore.WHITE}{Style.DIM}{out}\n")
