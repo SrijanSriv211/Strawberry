@@ -27,7 +27,7 @@ class CastedLinear(nn.Module):
 		self.in_features = in_features
 		self.out_features = out_features
 
-		self.weight = nn.Parameter(torch.empty(out_features, in_features))
+		self.weight = nn.Parameter(torch.empty(8, in_features + out_features))
 
 		# init params
 		self.reset_parameters()
@@ -38,8 +38,18 @@ class CastedLinear(nn.Module):
 		with torch.no_grad():
 			self.weight.uniform_(-s, s)
 
+	# construct the weights from polar values (radius `r` & direction `theta`)
+	def construct_weight(self):
+		d = self.out_features // 2
+
+		w0 = self.weight[..., :self.in_features]
+		w1 = self.weight[..., self.in_features:]
+		w_cos_sin = torch.cat([torch.cos(w1[..., :d]), torch.sin(w1[..., d:])], dim=-1)
+
+		return w_cos_sin.T @ w0 * 8**-0.5
+
 	def forward(self, x):
-		return F.linear(x, self.weight)
+		return F.linear(x, self.construct_weight())
 
 class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
@@ -53,6 +63,22 @@ class AttentionOnDetail(nn.Module):
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
+
+		# L = 8
+
+		# # compute padding needed to make T divisible by K
+		# r = T % L
+		# p = (L - r) % L # ensures 0 when already divisible
+		
+		# # pad at the end
+		# if p > 0:
+		# 	x = F.pad(x, (p, 0), value=0)
+
+		# # reshape patches
+		# N = x.size(1) // L
+		# x = x.view(B, N, -1)
+		# print(x.shape, cos_sin[0].shape)
+		# import sys; sys.exit()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v = self.qkv(x).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, hs)
@@ -119,7 +145,7 @@ class Strawberry(nn.Module):
 		# factorized token embeddings
 		self.embed = nn.Embedding(config.vocab_size, config.n_embd)
 		self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
-		self.unembed = CastedLinear(config.n_embd, config.vocab_size)
+		self.unembed = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 		self.embed.weight = self.unembed.weight
 
 		# to support meta device initialization, we init the rotary embeddings here, but it's fake

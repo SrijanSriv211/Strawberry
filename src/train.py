@@ -153,18 +153,18 @@ class dataloader:
 				dataset = pickle.load(f)["dataset"]
 
 			random.shuffle(dataset)
-			flat_dataset = chain.from_iterable(dataset)
-			# for data in dataset:
-			# 	n_train_toks = int(len(data) * self.data_division)
-			# 	self.train.extend(data[:n_train_toks])
-			# 	self.val.extend(data[n_train_toks:])
+			# flat_dataset = chain.from_iterable(dataset)
+			for data in dataset:
+				n_train_toks = int(len(data) * self.data_division)
+				self.train.extend(data[:n_train_toks])
+				self.val.extend(data[n_train_toks:])
 			del dataset
 
-			flat_dataset = list(flat_dataset)
-			n_train_toks = int(len(flat_dataset) * self.data_division)
+			# flat_dataset = list(flat_dataset)
+			# n_train_toks = int(len(flat_dataset) * self.data_division)
 
-			self.train.extend(flat_dataset[:n_train_toks])
-			self.val.extend(flat_dataset[n_train_toks:])
+			# self.train.extend(flat_dataset[:n_train_toks])
+			# self.val.extend(flat_dataset[n_train_toks:])
 
 		n_train_toks, n_val_toks = len(self.train), len(self.val)
 		self.train = torch.tensor(self.train, dtype=torch.int64)
@@ -391,5 +391,5 @@ stats["loss"]["val"].append(losses["val"])
 stats["step"] += 1
 
 ### sample generation
-out = model.generate([], sink_tok, hyperparams["block_size"])[0].tolist()
+out = model.generate([], sink_tok, hyperparams["block_size"], device=device)[0].tolist()
 print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)
