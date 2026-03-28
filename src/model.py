@@ -38,8 +38,8 @@ class PolarLinear(nn.Module):
 	def reset_parameters(self):
 		s = 3**0.5 * self.in_features**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 		with torch.no_grad():
-			self.radius.uniform_(-s, s)
-			self.angle.uniform_(-s, s)
+			self.radius.uniform_(0, 2*s) # non-negative only
+			self.angle.uniform_(-1, 1) # full circle coverage
 
 	# construct the weights from polar values (radius `r` & direction `theta`)
 	def construct_weight(self):
