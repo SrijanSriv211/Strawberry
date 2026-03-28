@@ -21,13 +21,15 @@ def apply_rotary_emb(x, cos, sin):
 	y2 = x1 * (-sin) + x2 * cos
 	return torch.cat([y1, y2], 3)
 
-class CastedLinear(nn.Module):
+class PolarLinear(nn.Module):
 	def __init__(self, in_features, out_features):
 		super().__init__()
 		self.in_features = in_features
 		self.out_features = out_features
+		self.rank = 8
 
-		self.weight = nn.Parameter(torch.empty(8, in_features + out_features))
+		self.radius = nn.Parameter(torch.empty(in_features, self.rank))
+		self.angle = nn.Parameter(torch.empty(self.rank, out_features // 2))
 
 		# init params
 		self.reset_parameters()
@@ -36,20 +38,18 @@ class CastedLinear(nn.Module):
 	def reset_parameters(self):
 		s = 3**0.5 * self.in_features**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 		with torch.no_grad():
-			self.weight.uniform_(-s, s)
+			self.radius.uniform_(-s, s)
+			self.angle.uniform_(-s, s)
 
 	# construct the weights from polar values (radius `r` & direction `theta`)
 	def construct_weight(self):
-		d = self.out_features // 2
+		pi = self.angle * torch.pi
+		angle = torch.cat([torch.cos(pi), torch.sin(pi)], dim=-1)
 
-		w0 = self.weight[..., :self.in_features]
-		w1 = self.weight[..., self.in_features:]
-		w_cos_sin = torch.cat([torch.cos(w1[..., :d]), torch.sin(w1[..., d:])], dim=-1)
-
-		return w_cos_sin.T @ w0 * 8**-0.5
+		return self.radius @ angle * self.rank**-0.5
 
 	def forward(self, x):
-		return F.linear(x, self.construct_weight())
+		return F.linear(x, self.construct_weight().T)
 
 class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
@@ -57,8 +57,8 @@ class AttentionOnDetail(nn.Module):
 		self.n_head = config.n_head
 		n_qkv = config.n_embd * self.n_head
 
-		self.qkv = CastedLinear(config.n_embd, 3*n_qkv)
-		self.out = CastedLinear(n_qkv, config.n_embd*chunk)
+		self.qkv = PolarLinear(config.n_embd, 3*n_qkv)
+		self.out = PolarLinear(n_qkv, config.n_embd*chunk)
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
