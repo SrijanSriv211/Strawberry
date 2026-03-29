@@ -3,7 +3,7 @@ from utils import print_banner
 from encoder import Encoder
 
 from colorama import Style, Fore, init
-import argparse, torch
+import argparse, random, torch
 
 def generate(i, e, l=256, t=0.8, f=None, T=None, device="cpu"):
 	# create an instance of Strawberry
@@ -31,9 +31,9 @@ def generate(i, e, l=256, t=0.8, f=None, T=None, device="cpu"):
 	enc.load(e)
 
 	# encode text and generate output
-	enctxt = enc.encode(T, allowed_special="all") if T is not None else []
+	enctxt = enc.encode(T, allowed_special="all") if T is not None else [random.randint(0, len(enc.vocab) + len(enc.special_tokens))]
 	out = model.generate(
-		enctxt, enc.special_tokens["<|sink|>"], device=device,
+		enctxt, device=device,
 		max_new_tokens=l, temperature=t, top_k=f
 	)[0].tolist()
 	return enc.decode(out)

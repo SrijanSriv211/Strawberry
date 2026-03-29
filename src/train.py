@@ -137,13 +137,12 @@ if checkpoint is not None:
 		o.load_state_dict(s)
 
 class dataloader:
-	def __init__(self, path, block_size, batch_size, sink_tok, data_division=0.8, isfile=True):
+	def __init__(self, path, block_size, batch_size, data_division=0.8, isfile=True):
 		self.path = path
 		self.data_division = data_division
 		self.block_size, self.batch_size = block_size, batch_size
 
 		self.files = [path] if isfile else [os.path.join(path, i) for i in os.listdir(path) if os.path.isfile(os.path.join(path, i))]
-		self.sink_col = torch.full((self.batch_size, 1), sink_tok)
 
 	def load_dataset(self):
 		self.train, self.val = [], []
@@ -174,8 +173,8 @@ class dataloader:
 	def next_batch(self, split):
 		data = self.train if split == "train" else self.val
 		ix = torch.randint(len(data) - self.block_size, (self.batch_size,))
-		y = torch.stack([data[i:i + self.block_size] for i in ix])
-		x = torch.cat([self.sink_col, y[:, :-1]], dim=1) # x: prepend SINK, drop last token
+		x = torch.stack([data[i:i + self.block_size] for i in ix])
+		y = torch.stack([data[i+1:i+1 + self.block_size] for i in ix])
 		return x.to(device), y.to(device)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -213,12 +212,11 @@ def get_state(model: Strawberry, optimizers: list[torch.optim.AdamW, Muon]):
 # load encoder
 enc = Encoder()
 enc.load(CONFIG["encoder_path"])
-sink_tok = enc.special_tokens["<|sink|>"]
 
 # load dataset
 dataset = dataloader(
 	CONFIG["dataset"]["path"],
-	hyperparams["block_size"], CONFIG["batch_size"], sink_tok,
+	hyperparams["block_size"], CONFIG["batch_size"],
 	CONFIG["dataset"]["data_division"], CONFIG["dataset"]["load_from_file"]
 )
 n_train_toks, n_val_toks = dataset.load_dataset()
@@ -245,7 +243,7 @@ model = torch.compile(model)
 # start training the model
 print0("started training", log_path=log_path)
 start_time = eval_t0 = test_t0 = time.time()
-n_steps = CONFIG["max_iters"] - stats["step"]
+n_steps = CONFIG["max_iters"] - stats["step"] + 1
 steps_per_epoch = int((n_train_toks + n_val_toks) / (hyperparams["block_size"] * CONFIG["batch_size"]))
 
 for _ in range(n_steps):
@@ -337,7 +335,7 @@ for _ in range(n_steps):
 		stats["loss"]["val"].append(losses["val"])
 
 		### sample generation
-		out = model.generate([], sink_tok, hyperparams["block_size"], device=device)[0].tolist()
+		out = model.generate([random.randint(0, len(enc.vocab) + len(enc.special_tokens))], hyperparams["block_size"], device=device)[0].tolist()
 		print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)
 
 	## log test loss
@@ -367,29 +365,3 @@ for _ in range(n_steps):
 
 print0("total time:", calc_total_time(time.time() - start_time), log_path=log_path)
 torch.save(get_state(model, optimizers), CONFIG["model_path"])
-
-losses = estimate_loss(model, dataset.next_batch)
-eval_t1 = time.time()
-eval_dt = eval_t1 - eval_t0
-eval_t0 = eval_t1
-
-print0(
-	f"{Fore.WHITE}{Style.BRIGHT}step",
-	f"{Fore.WHITE}{Style.DIM}[{stats["step"]}/{CONFIG["max_iters"]}]"
-	f"{Fore.RESET}{Style.RESET_ALL}:",
-	f"train loss {Fore.WHITE}{Style.BRIGHT}{losses["train"]:.4f}"
-	f"{Fore.RESET}{Style.RESET_ALL},",
-	f"val loss {Fore.WHITE}{Style.BRIGHT}{losses["val"]:.4f}"
-	f"{Fore.RESET}{Style.RESET_ALL},",
-	f"lr {Fore.WHITE}{Style.BRIGHT}{lr:.7f}"
-	f"{Fore.RESET}{Style.RESET_ALL},",
-	f"time took {Fore.WHITE}{Style.DIM}{calc_total_time(eval_dt)}",
-	log_path=log_path
-)
-stats["loss"]["train"].append(losses["train"])
-stats["loss"]["val"].append(losses["val"])
-stats["step"] += 1
-
-### sample generation
-out = model.generate([], sink_tok, hyperparams["block_size"], device=device)[0].tolist()
-print0(f"{Fore.WHITE}{Style.DIM}```\n{enc.decode(out)}\n```", log_path=log_path)

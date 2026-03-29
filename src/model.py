@@ -21,36 +21,36 @@ def apply_rotary_emb(x, cos, sin):
 	y2 = x1 * (-sin) + x2 * cos
 	return torch.cat([y1, y2], 3)
 
-class PolarLinear(nn.Module):
-	def __init__(self, in_features, out_features):
-		super().__init__()
-		self.in_features = in_features
-		self.out_features = out_features
-		self.rank = 8
+# class PolarLinear(nn.Module):
+# 	def __init__(self, in_features, out_features):
+# 		super().__init__()
+# 		self.in_features = in_features
+# 		self.out_features = out_features
+# 		self.rank = 8
 
-		self.origin = nn.Parameter(torch.empty(out_features))
-		self.radius = nn.Parameter(torch.empty(in_features, self.rank))
-		self.angle = nn.Parameter(torch.empty(self.rank, out_features // 2))
+# 		self.origin = nn.Parameter(torch.empty(out_features))
+# 		self.radius = nn.Parameter(torch.empty(in_features, self.rank))
+# 		self.angle = nn.Parameter(torch.empty(self.rank, out_features // 2))
 
-		# init params
-		self.reset_parameters()
+# 		# init params
+# 		self.reset_parameters()
 
-	# transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
-	def reset_parameters(self):
-		s = 3**0.5 * self.in_features**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-		with torch.no_grad():
-			self.origin.uniform_(-s, s)
-			self.radius.uniform_(0, 2*s)
-			self.angle.uniform_(-1, 1)
+# 	# transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
+# 	def reset_parameters(self):
+# 		s = 3**0.5 * self.in_features**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+# 		with torch.no_grad():
+# 			self.origin.uniform_(-s, s)
+# 			self.radius.uniform_(0, 2*s)
+# 			self.angle.uniform_(-1, 1)
 
-	# construct the weights from polar values (radius `r` & direction `theta`)
-	def construct_weight(self):
-		pi = self.angle * torch.pi
-		angle = torch.cat([torch.cos(pi), torch.sin(pi)], dim=-1)
-		return self.radius @ angle * self.rank**-0.5 + self.origin
+# 	# construct the weights from polar values (radius `r` & direction `theta`)
+# 	def construct_weight(self):
+# 		pi = self.angle * torch.pi
+# 		angle = torch.cat([torch.cos(pi), torch.sin(pi)], dim=-1)
+# 		return self.radius @ angle * self.rank**-0.5 + self.origin
 
-	def forward(self, x):
-		return F.linear(x, self.construct_weight().T)
+# 	def forward(self, x):
+# 		return F.linear(x, self.construct_weight().T)
 
 class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
@@ -58,31 +58,20 @@ class AttentionOnDetail(nn.Module):
 		self.n_head = config.n_head
 		n_qkv = config.n_embd * self.n_head
 
-		self.qkv = PolarLinear(config.n_embd, 3*n_qkv)
-		self.out = PolarLinear(n_qkv, config.n_embd*chunk)
+		self.qkv = nn.Linear(config.n_embd, 3*n_qkv, bias=False)
+		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
+		self.sink = nn.Linear(config.n_embd, 1, bias=False).weight
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
-		# L = 8
-
-		# # compute padding needed to make T divisible by K
-		# r = T % L
-		# p = (L - r) % L # ensures 0 when already divisible
-		
-		# # pad at the end
-		# if p > 0:
-		# 	x = F.pad(x, (p, 0), value=0)
-
-		# # reshape patches
-		# N = x.size(1) // L
-		# x = x.view(B, N, -1)
-		# print(x.shape, cos_sin[0].shape)
-		# import sys; sys.exit()
+		# apply attention sink to the sequence
+		s = self.sink.repeat_interleave(B, dim=0).unsqueeze(1)
+		x0 = torch.cat([s, x], dim=1)
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = self.qkv(x).view(B, T, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, hs)
+		q, k, v = self.qkv(x0).view(B, T+1, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -95,8 +84,8 @@ class AttentionOnDetail(nn.Module):
 		# calculate sdpa
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
 
-		# re-assemble all head outputs side by side
-		y = y.transpose(1, 2).contiguous().view(B, T, -1)
+		# re-assemble all head outputs side by side and remove attention sink from the sequence
+		y = y.transpose(1, 2).contiguous().view(B, T+1, -1)[:, 1:, :]
 		return self.out(y)
 
 class Silia(nn.Module):
@@ -174,7 +163,7 @@ class Strawberry(nn.Module):
 
 		# grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
 		assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-		cos_sin = self.cos[:, :+T], self.sin[:, :+T]
+		cos_sin = self.cos[:, :+T+1], self.sin[:, :+T+1]
 
 		# token embeddings of shape (b, t, n_embd)
 		x = self.embed(idx)
@@ -193,15 +182,13 @@ class Strawberry(nn.Module):
 		return logits, loss
 
 	@torch.no_grad()
-	def generate(self, idx, sink_tok, max_new_tokens, device, temperature=1.0, top_k=None):
-		sink_tok = torch.tensor([sink_tok], dtype=torch.int64, device=device).unsqueeze(0)
+	def generate(self, idx, max_new_tokens, device, temperature=1.0, top_k=None):
 		idx = torch.tensor(idx, dtype=torch.int64, device=device).unsqueeze(0)
 
 		for _ in range(max_new_tokens):
 			# our very first step, pass the initial sequence context to the model
 			# if the sequence context is growing too long we must crop it at block_size
 			idx_cond = idx[:, -self.rotary_block_size:] if idx.size(1) > self.rotary_block_size else idx
-			idx_cond = torch.cat([sink_tok, idx_cond], dim=1)
 
 			# forward the model to get the logits for the index in the sequence
 			logits, _ = self(idx_cond)
@@ -224,7 +211,5 @@ class Strawberry(nn.Module):
 
 			else:
 				idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-
-			# replace MASK with predicted token
 			idx = torch.cat([idx, idx_next], dim=1)
 		return idx
