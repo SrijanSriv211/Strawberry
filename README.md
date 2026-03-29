@@ -8,7 +8,8 @@ Changes over the standard nanoGPT architecture:
 1. Modernized architecture: Rotary embeddings and QK-Norm
 2. Silia (Silu in Attention), replace FFN with attention
 3. Attention residuals proposed by MoonshotAI ([paper](https://arxiv.org/pdf/2603.15031))
-4. Shared embedding weights
+4. Applied Qwen3-Next's gated attention ([paper](https://arxiv.org/pdf/2505.06708))
+5. Shared embedding weights
 
 ### Architecture Design
 ```

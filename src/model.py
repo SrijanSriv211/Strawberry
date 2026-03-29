@@ -58,9 +58,10 @@ class AttentionOnDetail(nn.Module):
 		self.n_head = config.n_head
 		n_qkv = config.n_embd * self.n_head
 
-		self.qkv = nn.Linear(config.n_embd, 3*n_qkv, bias=False)
-		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
+		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
 		self.sink = nn.Linear(config.n_embd, 1, bias=False).weight
+		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
+		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
@@ -71,18 +72,26 @@ class AttentionOnDetail(nn.Module):
 		x0 = torch.cat([s, x], dim=1)
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v = self.qkv(x0).view(B, T+1, self.n_head, -1).chunk(3, dim=-1) # (B, T, nh, hs)
+		q, k, v, g = self.qkvg(x0).view(B, T+1, self.n_head, -1).chunk(4, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
 		q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
 		q, k = norm(q), norm(k) # QK norm
 
+		# sharper attention
+		q = q * self.tao[0]
+		k = k * self.tao[1]
+
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
-		q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
 		# calculate sdpa
 		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+
+		# apply gated attention
+		# https://arxiv.org/pdf/2505.06708
+		y = y * F.sigmoid(g)
 
 		# re-assemble all head outputs side by side and remove attention sink from the sequence
 		y = y.transpose(1, 2).contiguous().view(B, T+1, -1)[:, 1:, :]
