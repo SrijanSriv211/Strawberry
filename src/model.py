@@ -21,58 +21,143 @@ def apply_rotary_emb(x, cos, sin):
 	y2 = x1 * (-sin) + x2 * cos
 	return torch.cat([y1, y2], 3)
 
-# class PolarLinear(nn.Module):
-# 	def __init__(self, in_features, out_features):
+# """
+# "Pro" in `ProLinear` stands for Progression, from Arithmetic progression.
+
+# I came up with this idea when I was analyzing weights of already pretrained models.
+# I found out that when you sort all the parameters of a linear layer you get a pretty smooth fall. Something like this:
+
+# ```
+# [1.2345, 0.987, 0.9723, 0.8723, 0.5149, ..., -0.963]
+# ```
+
+# When you take it's mean, the mean's between 0.01-0.5.
+# If you take 2 values and subtract the prior to the latter in such a way `1.2345 - 0.987` you get values like this 0.2475 (for example in this case).
+# These values can range anywhere between [-1, 1] including both ends.
+# Basically the parameters of a model can compressed into a much much much smaller list of numbers and can be constructed back.
+
+# `ProLinear` constructs the weight on this exact same idea. Have a starting value, randomly select a difference,
+# add that difference to the starting value, append it to a list, take the last value of the list,
+# randomly select a difference and continue from here.
+
+# After that shuffle the list then reshape the list into the desired shape.
+
+# Here all the values, starting value, differences, and seeds for both random selector of difference and shuffler are trainable,
+# so that the model can adjust them on their own.
+# """
+# class ProLinear(nn.Module):
+# 	def __init__(self, in_features, out_features, size=512):
 # 		super().__init__()
 # 		self.in_features = in_features
 # 		self.out_features = out_features
-# 		self.rank = 8
+# 		self.size = size
 
-# 		self.origin = nn.Parameter(torch.empty(out_features))
-# 		self.radius = nn.Parameter(torch.empty(in_features, self.rank))
-# 		self.angle = nn.Parameter(torch.empty(self.rank, out_features // 2))
+# 		self.diffs = nn.Parameter(torch.empty(self.size))
+# 		self.gen = torch.Generator()
 
-# 		# init params
 # 		self.reset_parameters()
 
 # 	# transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
 # 	def reset_parameters(self):
+# 		n = self.in_features * self.out_features
 # 		s = 3**0.5 * self.in_features**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
 # 		with torch.no_grad():
-# 			self.origin.uniform_(-s, s)
-# 			self.radius.uniform_(0, 2*s)
-# 			self.angle.uniform_(-1, 1)
+# 			self.diffs.uniform_(-s / n**0.5, s / n**0.5) # cumsum over n steps amplifies by sqrt(n), so we shrink steps to compensate
 
-# 	# construct the weights from polar values (radius `r` & direction `theta`)
 # 	def construct_weight(self):
-# 		pi = self.angle * torch.pi
-# 		angle = torch.cat([torch.cos(pi), torch.sin(pi)], dim=-1)
-# 		return self.radius @ angle * self.rank**-0.5 + self.origin
+# 		self.gen.manual_seed(42)
+
+#         # sample which difference to add at each step
+# 		n = self.in_features * self.out_features
+# 		indices = torch.randint(0, self.diffs.size(0), (n - 1,), generator=self.gen)
+
+#         # build the AP-style list: start, start+d0, start+d0+d1, ...
+# 		selected_diffs = self.diffs[indices]
+# 		cumulative = torch.cumsum(selected_diffs, dim=0)
+# 		weight = cumulative[torch.randperm(n, generator=self.gen)]
+# 		weight = weight * 3**0.5 * self.in_features**-0.5
+
+# 		return weight.view(self.out_features, self.in_features)
 
 # 	def forward(self, x):
-# 		return F.linear(x, self.construct_weight().T)
+# 		return F.linear(x, self.construct_weight())
 
 class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
 		super().__init__()
 		self.n_head = config.n_head
 		n_qkv = config.n_embd * self.n_head
+		self.T0 = 16 # number of tokens in each chunk
 
+		self.sink = nn.Parameter(torch.empty(1, self.n_head, config.n_embd))
 		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
-		self.sink = nn.Linear(config.n_embd, 1, bias=False).weight
+		self.patch = nn.Linear(self.T0 * config.n_embd, 1, bias=False).weight
+
 		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 
+	def patch_toks(self, x):
+		# batch size, sequence length, embedding dimensionality (n_embd)
+		B, T, C = x.size()
+
+		# context already smaller or of-the-size of the patch, so don't patch and just move on.
+		if T <= self.T0:
+			return x, None, None, 0
+
+		# calculate num pad tokens
+		P = (self.T0 - (T % self.T0)) % self.T0
+
+		# calculate qkv & pad `x` if the it's not properly divisible
+		x0 = torch.cat([torch.zeros(B, P, C), x], dim=1) if P > 0 else x
+		x0 = x0.view(B, (T + P) // self.T0, -1) # (B, T+P, C) -> (B, (T + P) // T0, T0*C)
+
+		# (B, (T + P) // T0)
+		y = norm(x0) @ self.patch.view(-1)
+		y = torch.softmax(y, dim=-1)
+		i = y.topk(self.T0 // 4, dim=-1).indices # select the top `T0/4` indices
+		i = i.sort(dim=-1).values # sort indices from first -> last
+
+		# bottom `K` indices sorted from first to last
+		i0 = y.topk(self.T0 * 3 // 4, dim=-1, largest=False).indices
+		i0 = i0.sort(dim=-1).values
+
+		# return input `x` and topk indices/patches
+		return x0.view(B, -1, C), i, i0, P
+
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
-		B, T, _ = x.size()
+		B, T, C = x.size()
+
+		# group tokens into multiple patches and select topk most relevant patchs
+		x0, I, I0, P = self.patch_toks(x)
+
+		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
+		qkvg = self.qkvg(x0)
+
+		# (B, K, nh, hs)
+		if I is not None:
+			q, k, v, g = qkvg.view(B, (T + P) // self.T0, -1).chunk(4, dim=-1) # (B, K, nh*hs)
+			batch_idx = torch.arange(B).unsqueeze(1)
+
+			# (B, K, nh, hs)
+			q0 = q[batch_idx, I0, ...].view(B, -1, self.n_head, C)
+			q = q[batch_idx, I, ...].view(B, -1, self.n_head, C)
+			k = k[batch_idx, I, ...].view(B, -1, self.n_head, C)
+			v = v[batch_idx, I, ...].view(B, -1, self.n_head, C)
+			g = g.contiguous().view(B, -1, self.n_head, C)
+
+		else:
+			q, k, v, g = qkvg.view(B, T, self.n_head -1).chunk(4, dim=-1) # (B, T, nh, hs)
+			q0 = None
 
 		# apply attention sink to the sequence
 		s = self.sink.repeat_interleave(B, dim=0).unsqueeze(1)
-		x0 = torch.cat([s, x], dim=1)
+		q = torch.cat([s, q], dim=1)
+		k = torch.cat([s, k], dim=1)
+		v = torch.cat([s, v], dim=1)
 
-		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		q, k, v, g = self.qkvg(x0).view(B, T+1, self.n_head, -1).chunk(4, dim=-1) # (B, T, nh, hs)
+		print(x.shape, x0.shape, q.shape, q0.shape, g.shape)
+		import sys; sys.exit()
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -87,14 +172,14 @@ class AttentionOnDetail(nn.Module):
 		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
 		# calculate sdpa
-		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)[:, :, 1:, :]
 
 		# apply gated attention
 		# https://arxiv.org/pdf/2505.06708
 		y = y * F.sigmoid(g)
 
 		# re-assemble all head outputs side by side and remove attention sink from the sequence
-		y = y.transpose(1, 2).contiguous().view(B, T+1, -1)[:, 1:, :]
+		y = y.transpose(1, 2).contiguous().view(B, T, -1)
 		return self.out(y)
 
 class Silia(nn.Module):
