@@ -30,6 +30,7 @@ class AttentionOnDetail(nn.Module):
 		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
 		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
+		self.sink = nn.Parameter(torch.zeros(1, self.n_head, 1, config.n_embd*2))
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
@@ -50,8 +51,13 @@ class AttentionOnDetail(nn.Module):
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
 		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
+		# apply attention sink
+		sk, sv = self.sink.expand(B, -1, -1, -1).chunk(2, dim=-1)
+		k0 = torch.cat([sk, k], dim=2)
+		v0 = torch.cat([sv, v], dim=2)
+
 		# calculate sdpa
-		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+		y = F.scaled_dot_product_attention(q, k0, v0, attn_mask=None, is_causal=True)
 
 		# XSA mode
 		vn = torch.nn.functional.normalize(v, dim=-1)
