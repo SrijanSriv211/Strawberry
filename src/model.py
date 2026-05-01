@@ -24,6 +24,7 @@ def apply_rotary_emb(x, cos, sin):
 class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
 		super().__init__()
+		assert config.n_head >= 4
 		self.n_head = config.n_head
 		self.n_embd = config.n_embd
 		n_qkv = config.n_embd * self.n_head
@@ -33,7 +34,9 @@ class AttentionOnDetail(nn.Module):
 		self.w = nn.Linear(self.n_head, config.n_embd*config.n_embd*2, bias=False)
 
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
+		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 		self.sink = nn.Parameter(torch.zeros(1, self.n_head, 1, config.n_embd*2))
+		self.L = 8 # compressed sequence length
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
@@ -54,15 +57,36 @@ class AttentionOnDetail(nn.Module):
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
 		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
+		# compressed attention
+		k0, k1 = k.chunk(2, dim=1)
+		v0, v1 = v.chunk(2, dim=1)
+
+		k1 = k1 * F.softmax(k0, dim=2)
+		v1 = v1 * F.softmax(v0, dim=2)
+
+		k1 = k1.repeat_interleave(2, dim=1)
+		v1 = v1.repeat_interleave(2, dim=1)
+
+		if T > self.L and T % self.L != 0:
+			L = self.L - (T % self.L)
+			Z = torch.zeros(B, L, self.n_head, self.n_embd)
+			k1 = torch.cat([k1, Z], dim=2)
+			v1 = torch.cat([v1, Z], dim=2)
+
+		k1 = k1.view(B, self.n_head, -1, self.L, self.n_embd).sum(dim=-2)
+		v1 = v1.view(B, self.n_head, -1, self.L, self.n_embd).sum(dim=-2)
+		k1[:, :, 1:, :] = k1[:, :, 1:, :] + k1[:, :, :-1, :]
+		v1[:, :, 1:, :] = v1[:, :, 1:, :] + v1[:, :, :-1, :]
+
 		# apply attention sink
 		# append learnable weights to simulate boltzmann machine
 		sk, sv = self.sink.expand(B, -1, -1, -1).chunk(2, dim=-1)
 		wk, wv = self.w.weight.view(self.n_head, self.n_embd, -1).expand(B, -1, -1, -1).chunk(2, dim=-1)
-		k0 = torch.cat([sk, k, wk], dim=2)
-		v0 = torch.cat([sv, v, wv], dim=2)
+		k2 = torch.cat([sk, k1, wk], dim=2)
+		v2 = torch.cat([sv, v1, wv], dim=2)
 
 		# calculate sdpa
-		y = F.scaled_dot_product_attention(q, k0, v0, attn_mask=None, is_causal=True)
+		y = F.scaled_dot_product_attention(q, k2, v2, attn_mask=None, is_causal=True)
 
 		# XSA mode
 		# https://arxiv.org/pdf/2603.09078
