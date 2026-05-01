@@ -25,10 +25,13 @@ class AttentionOnDetail(nn.Module):
 	def __init__(self, config: Config, chunk=1):
 		super().__init__()
 		self.n_head = config.n_head
+		self.n_embd = config.n_embd
 		n_qkv = config.n_embd * self.n_head
 
 		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
 		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
+		self.w = nn.Linear(self.n_head, config.n_embd*config.n_embd*2, bias=False)
+
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 		self.sink = nn.Parameter(torch.zeros(1, self.n_head, 1, config.n_embd*2))
 
@@ -52,14 +55,17 @@ class AttentionOnDetail(nn.Module):
 		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
 		# apply attention sink
+		# append learnable weights to simulate boltzmann machine
 		sk, sv = self.sink.expand(B, -1, -1, -1).chunk(2, dim=-1)
-		k0 = torch.cat([sk, k], dim=2)
-		v0 = torch.cat([sv, v], dim=2)
+		wk, wv = self.w.weight.view(self.n_head, self.n_embd, -1).expand(B, -1, -1, -1).chunk(2, dim=-1)
+		k0 = torch.cat([sk, k, wk], dim=2)
+		v0 = torch.cat([sv, v, wv], dim=2)
 
 		# calculate sdpa
 		y = F.scaled_dot_product_attention(q, k0, v0, attn_mask=None, is_causal=True)
 
 		# XSA mode
+		# https://arxiv.org/pdf/2603.09078
 		vn = torch.nn.functional.normalize(v, dim=-1)
 		y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
 
