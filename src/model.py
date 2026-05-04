@@ -28,42 +28,19 @@ class AttentionOnDetail(nn.Module):
 		self.n_embd = config.n_embd
 		n_qkv = config.n_embd * self.n_head
 
-		self.qkvg = nn.Linear(config.n_embd, 5*n_qkv, bias=False)
+		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
 		self.out = nn.Linear(n_qkv, config.n_embd*chunk, bias=False)
-		self.kv_up = nn.Linear(config.n_embd, 2*config.n_embd, bias=False)
 		self.boltzmann = nn.Linear(self.n_head*config.n_embd, 2*config.n_embd, bias=False).weight
 
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 		self.sink = nn.Parameter(torch.zeros(1, self.n_head, 1, config.n_embd*2))
-		self.L = 8 # latent sequence length
-
-	def compressor(self, kv):
-		B, T, _, _ = kv.size()
-
-		# chunk kv into hidden state and softmax over tokens
-		h, s, v0 = kv.chunk(3, dim=-1)
-		z = h * F.softmax(s, dim=1)
-
-		# padding to make seq divisible
-		L = self.L - (T % self.L)
-		zeros = torch.zeros(B, L, self.n_head, self.n_embd)
-		z = torch.cat([z, zeros], dim=1)
-
-		# sum over patches
-		z = z.view(B, -1, self.L, self.n_head, self.n_embd).sum(dim=2)
-		z[:, :, 1:, :] = z[:, :, :-1, :] + z[:, :, 1:, :] # add previous compressed tokens with current
-
-		k, v = self.kv_up(z).chunk(2, dim=-1)
-		return k, v, v0
 
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
-		qkvg = self.qkvg(x).view(B, T, self.n_head, -1) # (B, T, nh, 5*hs)
-		q, g, kv = torch.split(qkvg, [self.n_embd, self.n_embd, 3*self.n_embd], dim=-1) # q, g -> (B, T, nh, hs); kv -> (B, T, nh, 4*hs)
-		k, v, v0 = self.compressor(kv)
+		q, k, v, g = self.qkvg(x).view(B, T, self.n_head, -1).chunk(4, dim=-1) # (B, T, nh, hs)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -75,7 +52,7 @@ class AttentionOnDetail(nn.Module):
 		k = k * self.tao[1]
 
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
-		q, k, v, v0, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), v0.transpose(1, 2), g.transpose(1, 2)
+		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
 
 		# apply attention sink and append learnable weights to simulate boltzmann machine
 		boltzmann = self.boltzmann.view(self.n_head, self.n_embd, -1)
@@ -83,14 +60,14 @@ class AttentionOnDetail(nn.Module):
 		wk, wv = boltzmann.expand(B, -1, -1, -1).chunk(2, dim=-1)
 
 		k = torch.cat([sk, k, wk], dim=2)
-		v = torch.cat([sv, v, wv], dim=2)
+		v0 = torch.cat([sv, v, wv], dim=2)
 
 		# calculate sdpa
-		y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+		y = F.scaled_dot_product_attention(q, k, v0, attn_mask=None, is_causal=True)
 
 		# XSA mode
 		# https://arxiv.org/pdf/2603.09078
-		vn = torch.nn.functional.normalize(v0, dim=-1)
+		vn = torch.nn.functional.normalize(v, dim=-1)
 		y = y - (y * vn).sum(dim=-1, keepdim=True) * vn
 
 		# apply gated attention
