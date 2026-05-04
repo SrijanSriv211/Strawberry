@@ -66,10 +66,9 @@ if CONFIG["seed"] != "auto":
 	torch.manual_seed(CONFIG["seed"])
 	random.seed(CONFIG["seed"])
 
-if CONFIG["checkpoints"]["create_checkpoints"] and not os.path.isdir(CONFIG["checkpoints"]["path"]):
+if not os.path.isdir(CONFIG["checkpoints"]["path"]):
 	os.mkdir(CONFIG["checkpoints"]["path"])
-
-log_path = CONFIG["checkpoints"]["path"] if CONFIG["checkpoints"]["create_checkpoints"] else "bin"
+log_path = CONFIG["checkpoints"]["path"]
 
 # set device
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,18 +151,18 @@ class dataloader:
 				dataset = pickle.load(f)["dataset"]
 
 			random.shuffle(dataset)
-			flat_dataset = chain.from_iterable(dataset)
-			# for data in dataset:
-			# 	n_train_toks = int(len(data) * self.data_division)
-			# 	self.train.extend(data[:n_train_toks])
-			# 	self.val.extend(data[n_train_toks:])
+			# flat_dataset = chain.from_iterable(dataset)
+			for data in dataset:
+				n_train_toks = int(len(data) * self.data_division)
+				self.train.extend(data[:n_train_toks])
+				self.val.extend(data[n_train_toks:])
 			del dataset
 
-			flat_dataset = list(flat_dataset)
-			n_train_toks = int(len(flat_dataset) * self.data_division)
+			# flat_dataset = list(flat_dataset)
+			# n_train_toks = int(len(flat_dataset) * self.data_division)
 
-			self.train.extend(flat_dataset[:n_train_toks])
-			self.val.extend(flat_dataset[n_train_toks:])
+			# self.train.extend(flat_dataset[:n_train_toks])
+			# self.val.extend(flat_dataset[n_train_toks:])
 
 		n_train_toks, n_val_toks = len(self.train), len(self.val)
 		self.train = torch.tensor(self.train, dtype=torch.int64)
