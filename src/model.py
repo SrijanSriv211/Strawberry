@@ -6,6 +6,7 @@ import torch.nn as nn, torch
 class Config:
 	vocab_size: int = 8192
 	block_size: int = 1024
+	latent_block_size: int = 16
 	n_layer: int = 2 # new layers
 	n_head: int = 4
 	n_embd: int = 64
@@ -26,6 +27,7 @@ class AttentionOnDetail(nn.Module):
 		super().__init__()
 		self.n_head = config.n_head
 		self.n_embd = config.n_embd
+		self.latent_block_size = config.latent_block_size
 		n_qkv = config.n_embd * self.n_head
 
 		self.qkvg = nn.Linear(config.n_embd, 4*n_qkv, bias=False)
@@ -35,12 +37,38 @@ class AttentionOnDetail(nn.Module):
 		self.tao = nn.Parameter(torch.tensor([1.2, 1.2]))
 		self.sink = nn.Parameter(torch.zeros(1, self.n_head, 1, config.n_embd*2))
 
+		self.k_up = nn.Linear(config.n_embd, 2*config.n_embd, bias=False)
+		self.v_up = nn.Linear(config.n_embd, 2*config.n_embd, bias=False)
+
+	def build_cross_mask(self, q, k):
+		q_pos = torch.arange(q.size(2), dtype=q.dtype, device=q.device).unsqueeze(1)
+		k_pos = torch.arange(k.size(2), dtype=q.dtype, device=q.device)
+		thresholds = (k_pos * self.latent_block_size).unsqueeze(0)
+		return torch.where(q_pos >= thresholds, 0.0, float("-inf"))
+
+	def compress(self, H, up):
+		B, T, nh, hs = H.size()
+
+		# chunk to get divisible part of the seq
+		R = T - (T % self.latent_block_size)
+		h0 = H[:, :R, :, :]
+		h1 = H[:, R:, :, :]
+
+		# reshape h0 seq len into latent seq len
+		h0 = h0.view(B, -1, self.latent_block_size, nh, hs)
+		h0, s = up(h0).chunk(2, dim=-1)
+		h = h0 * F.softmax(s, dim=2) # cross product of h0 with softmax scores over latent seq
+		h = h.sum(dim=2) # sum over latent seq
+
+		return torch.cat([h, h1], dim=1)
+
 	def forward(self, x, cos_sin):
 		# batch size, sequence length, embedding dimensionality (n_embd)
 		B, T, _ = x.size()
 
 		# calculate query, key, values for all heads in batch and move head forward to be the batch dim
 		q, k, v, g = self.qkvg(x).view(B, T, self.n_head, -1).chunk(4, dim=-1) # (B, T, nh, hs)
+		k, v0 = self.compress(k, self.k_up), self.compress(v, self.v_up)
 
 		# apply rotary embeddings to queries and keys to get relative positional encoding
 		cos, sin = cos_sin
@@ -52,7 +80,7 @@ class AttentionOnDetail(nn.Module):
 		k = k * self.tao[1]
 
 		# make head be batch dim, i.e. (B, T, nh, hs) -> (B, nh, T, hs)
-		q, k, v, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), g.transpose(1, 2)
+		q, k, v, v0, g = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), v0.transpose(1, 2), g.transpose(1, 2)
 
 		# apply attention sink and append learnable weights to simulate boltzmann machine
 		boltzmann = self.boltzmann.view(self.n_head, self.n_embd, -1)
@@ -60,10 +88,11 @@ class AttentionOnDetail(nn.Module):
 		wk, wv = boltzmann.expand(B, -1, -1, -1).chunk(2, dim=-1)
 
 		k = torch.cat([sk, k, wk], dim=2)
-		v0 = torch.cat([sv, v, wv], dim=2)
+		v0 = torch.cat([sv, v0, wv], dim=2)
 
 		# calculate sdpa
-		y = F.scaled_dot_product_attention(q, k, v0, attn_mask=None, is_causal=True)
+		mask = self.build_cross_mask(q, k)
+		y = F.scaled_dot_product_attention(q, k, v0, attn_mask=mask, is_causal=False)
 
 		# XSA mode
 		# https://arxiv.org/pdf/2603.09078
